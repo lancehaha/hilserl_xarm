@@ -35,13 +35,28 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     # Algorithm config.
     algorithm: RLAlgorithmConfig | None = None
 
-    # Data mixer strategy name. Currently supports "online_offline".
+    # Data mixer strategy: uniform online/offline or episode-aware online replay.
     mixer: str = "online_offline"
     # Fraction sampled from online replay when using OnlineOfflineMixer.
     online_ratio: float = 0.5
+    # Episode-aware replay keeps this fraction of online samples for successful episodes.
+    success_replay_fraction: float = 0.25
+    # Probability that a successful episode sample selects a close/open command event.
+    event_replay_fraction: float = 0.25
+    # Start covering every step of one short success every N sampled batches; 0 disables sweeps.
+    episode_sweep_interval: int = 10
 
     def validate(self) -> None:
         super().validate()
+
+        if self.mixer not in {"online_offline", "episode_aware"}:
+            raise ValueError(f"Unsupported replay mixer: {self.mixer}")
+        for name in ("online_ratio", "success_replay_fraction", "event_replay_fraction"):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1, got {value}")
+        if self.episode_sweep_interval < 0:
+            raise ValueError("episode_sweep_interval must be non-negative")
 
         if self.algorithm is None:
             self.algorithm = make_algorithm_config("sac")

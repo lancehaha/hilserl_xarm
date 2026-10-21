@@ -231,16 +231,29 @@ class ReplayBuffer:
             self.position = (self.position + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> BatchTransition:
-        """Sample a random batch of transitions and collate them into batched tensors."""
+    def sample(self, batch_size: int, indices: Sequence[int] | None = None) -> BatchTransition:
+        """Sample random transitions, or collate the exact buffer slots in ``indices``."""
         if not self.initialized:
             raise RuntimeError("Cannot sample from an empty buffer. Add transitions first.")
 
         with self._lock:
-            batch_size = min(batch_size, self.size)
-            high = max(0, self.size - 1) if self.optimize_memory and self.size < self.capacity else self.size
-
-            idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+            newest = (self.position - 1) % self.capacity
+            newest_needs_next = self.optimize_memory and not bool(self.dones[newest])
+            if indices is None:
+                batch_size = min(batch_size, self.size)
+                high = max(1, self.size - 1) if newest_needs_next and self.size < self.capacity else self.size
+                idx = torch.randint(low=0, high=high, size=(batch_size,), device=self.storage_device)
+                if newest_needs_next and self.size == self.capacity:
+                    # The newest slot has no following observation in the circular buffer yet.
+                    idx[idx == newest] = (newest - 1) % self.capacity
+            else:
+                if batch_size != len(indices) or not indices:
+                    raise ValueError("indices must contain exactly batch_size buffer slots")
+                idx = torch.as_tensor(indices, dtype=torch.long, device=self.storage_device)
+                if bool(torch.any((idx < 0) | (idx >= self.size))):
+                    raise IndexError("Replay buffer slot is outside the populated range")
+                if newest_needs_next and bool(torch.any(idx == newest)):
+                    raise ValueError("The newest replay slot has no next observation yet")
 
             image_keys = [k for k in self.states if k.startswith(OBS_IMAGE)] if self.use_drq else []
 
@@ -255,6 +268,10 @@ class ReplayBuffer:
                 else:
                     next_idx = (idx + 1) % self.capacity
                     batch_next_state[key] = self.states[key][next_idx].to(self.device)
+                    # A terminal transition has no next action. Avoid reading an unwritten
+                    # slot (or the next episode's reset observation) for its masked target.
+                    terminal = self.dones[idx].to(self.device)
+                    batch_next_state[key][terminal] = batch_state[key][terminal]
 
             # Sample other tensors
             batch_actions = self.actions[idx].to(self.device)

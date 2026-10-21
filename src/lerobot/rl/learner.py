@@ -115,6 +115,7 @@ from .algorithms.base import RLAlgorithm
 from .algorithms.factory import make_algorithm
 from .buffer import ReplayBuffer
 from .data_sources import OnlineOfflineMixer
+from .data_sources.episode_replay import EpisodeAwareMixer, EpisodeReplayIndex
 from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 from .train_rl import TrainRLServerPipelineConfig
 from .trainer import RLTrainer
@@ -355,12 +356,28 @@ def add_actor_information_and_train(
             storage_device=storage_device,
         )
 
-    # DataMixer: online-only or online/offline 50-50 mix
-    data_mixer = OnlineOfflineMixer(
-        online_buffer=replay_buffer,
-        offline_buffer=offline_replay_buffer,
-        online_ratio=cfg.online_ratio,
-    )
+    episode_index = None
+    if cfg.mixer == "episode_aware":
+        reward_cfg = getattr(getattr(cfg.env, "processor", None), "reward_classifier", None)
+        success_reward = reward_cfg.success_reward if reward_cfg is not None else 1.0
+        episode_index = EpisodeReplayIndex(replay_buffer, success_reward=success_reward)
+        if cfg.resume:
+            episode_index.rebuild_from_buffer()
+        data_mixer = EpisodeAwareMixer(
+            online_buffer=replay_buffer,
+            offline_buffer=offline_replay_buffer,
+            index=episode_index,
+            online_ratio=cfg.online_ratio,
+            success_fraction=cfg.success_replay_fraction,
+            event_fraction=cfg.event_replay_fraction,
+            sweep_interval=cfg.episode_sweep_interval,
+        )
+    else:
+        data_mixer = OnlineOfflineMixer(
+            online_buffer=replay_buffer,
+            offline_buffer=offline_replay_buffer,
+            online_ratio=cfg.online_ratio,
+        )
     # RLTrainer owns the iterator, preprocessor, and creates optimizers.
     trainer = RLTrainer(
         algorithm=algorithm,
@@ -399,6 +416,7 @@ def add_actor_information_and_train(
             offline_replay_buffer=offline_replay_buffer,
             dataset_repo_id=dataset_repo_id,
             shutdown_event=shutdown_event,
+            episode_index=episode_index,
         )
 
         # Process all available interaction messages sent by the actor server
@@ -429,6 +447,11 @@ def add_actor_information_and_train(
         optimization_step = algorithm.optimization_step
         if optimization_step % log_freq == 0:
             training_infos["replay_buffer_size"] = len(replay_buffer)
+            if episode_index is not None:
+                training_infos["replay_success_episodes"] = len(episode_index.successful_episodes())
+                training_infos["replay_gripper_events"] = sum(
+                    len(record.event_slots) for record in episode_index.successful_episodes()
+                )
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
@@ -952,9 +975,10 @@ def process_interaction_message(
 def process_transitions(
     transition_queue: Queue,
     replay_buffer: ReplayBuffer,
-    offline_replay_buffer: ReplayBuffer,
+    offline_replay_buffer: ReplayBuffer | None,
     dataset_repo_id: str | None,
     shutdown_event: Any,  # Event
+    episode_index: EpisodeReplayIndex | None = None,
 ):
     """Process all available transitions from the queue.
 
@@ -969,6 +993,7 @@ def process_transitions(
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
 
+        valid_transitions = []
         for transition in transition_list:
             # Skip transitions with NaN values
             if check_nan_in_transition(
@@ -978,11 +1003,19 @@ def process_transitions(
             ):
                 logging.warning("[LEARNER] NaN detected in transition, skipping")
                 continue
+            valid_transitions.append(transition)
 
-            replay_buffer.add(**transition)
+        if episode_index is not None:
+            episode_index.add_episode(valid_transitions)
+        else:
+            for transition in valid_transitions:
+                replay_buffer.add(**transition)
 
+        for transition in valid_transitions:
             # Add to offline buffer if it's an intervention
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
+            if offline_replay_buffer is not None and dataset_repo_id is not None and (
+                transition.get("complementary_info") or {}
+            ).get(
                 TeleopEvents.IS_INTERVENTION.value
             ):
                 offline_replay_buffer.add(**transition)
