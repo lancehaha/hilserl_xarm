@@ -24,8 +24,11 @@
     "discount": 0.97,
     "utd_ratio": 1
   },
-  "mixer": "online_offline",
+  "mixer": "episode_aware",
   "online_ratio": 0.5,
+  "success_replay_fraction": 0.25,
+  "event_replay_fraction": 0.25,
+  "episode_sweep_interval": 10,
   "policy": {
     "type": "gaussian_actor",
     "push_to_hub": false,
