@@ -302,6 +302,25 @@ The actor runs the policy on the robot at 10 Hz and streams transitions to the l
 - online transitions;
 - your demos plus every intervention.
 
+`train.json` also selects `mixer: episode_aware` for the **online half** of each
+batch. Once the reward classifier marks a completed attempt successful, the
+learner indexes its transitions and close/open gripper commands. It draws 25%
+of online samples from successful attempts, with twice the episode-selection
+weight for the shorter half of successes. Of those selected steps, 25% are
+drawn from gripper command changes when available. Every ten batches it begins
+covering every transition of one short, complete success across successive
+batches. The rest of the online half remains uniformly sampled, so failures
+and recovery states remain available to SAC. These are replay weights, not
+extra rewards or sequence-model training. Shortness is measured by the end
+effector's traveled distance, so compare runs with similar task starts.
+
+To use the original uniform online/offline mix, set `mixer: online_offline`.
+The replay settings are `success_replay_fraction`, `event_replay_fraction`,
+and `episode_sweep_interval`; zero disables each respective emphasis. On
+resume, saved episodes are indexed again from the replay dataset. Saved data
+does not retain whether an action was a human intervention, so that field is
+only recorded for new episodes.
+
 It sends updated weights back every `policy_parameters_push_frequency` seconds.
 
 How to intervene:
