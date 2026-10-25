@@ -45,18 +45,28 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     event_replay_fraction: float = 0.25
     # Start covering every step of one short success every N sampled batches; 0 disables sweeps.
     episode_sweep_interval: int = 10
+    # Independent share of online batches reserved for transitions from one complete success.
+    trajectory_replay_fraction: float = 0.10
+    # Relative episode-selection weight for the shorter half of complete successes.
+    trajectory_short_weight: float = 2.0
 
     def validate(self) -> None:
         super().validate()
 
         if self.mixer not in {"online_offline", "episode_aware"}:
             raise ValueError(f"Unsupported replay mixer: {self.mixer}")
-        for name in ("online_ratio", "success_replay_fraction", "event_replay_fraction"):
+        for name in (
+            "online_ratio", "success_replay_fraction", "event_replay_fraction", "trajectory_replay_fraction"
+        ):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1, got {value}")
         if self.episode_sweep_interval < 0:
             raise ValueError("episode_sweep_interval must be non-negative")
+        if self.success_replay_fraction + self.trajectory_replay_fraction > 1.0:
+            raise ValueError("success_replay_fraction + trajectory_replay_fraction must be at most 1")
+        if self.trajectory_short_weight < 1.0:
+            raise ValueError("trajectory_short_weight must be at least 1")
 
         if self.algorithm is None:
             self.algorithm = make_algorithm_config("sac")

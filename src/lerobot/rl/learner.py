@@ -371,6 +371,8 @@ def add_actor_information_and_train(
             success_fraction=cfg.success_replay_fraction,
             event_fraction=cfg.event_replay_fraction,
             sweep_interval=cfg.episode_sweep_interval,
+            trajectory_fraction=cfg.trajectory_replay_fraction,
+            trajectory_short_weight=cfg.trajectory_short_weight,
         )
     else:
         data_mixer = OnlineOfflineMixer(
