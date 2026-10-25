@@ -197,16 +197,14 @@ class EpisodeReplayIndex:
             and any(self._eligible(slot, record.episode_id) for slot in record.slots)
         ]
 
-    def choose_short_success(self, *, complete_only: bool = False) -> EpisodeRecord | None:
+    def choose_short_success(
+        self, *, complete_only: bool = False, short_weight: float = 2.0
+    ) -> EpisodeRecord | None:
         records = self.successful_episodes(complete_only=complete_only)
         if not records:
             return None
-        if complete_only:
-            # Whole-episode sweeps only use the shorter half of complete successes.
-            records.sort(key=lambda record: record.path_length_m)
-            records = records[: max(1, (len(records) + 1) // 2)]
         midpoint = median(record.path_length_m for record in records)
-        weights = [2.0 if record.path_length_m <= midpoint else 1.0 for record in records]
+        weights = [short_weight if record.path_length_m <= midpoint else 1.0 for record in records]
         return random.choices(records, weights=weights, k=1)[0]
 
     def choose_step(self, record: EpisodeRecord, event_fraction: float) -> int | None:
@@ -231,6 +229,8 @@ class EpisodeAwareMixer(DataMixer):
         success_fraction: float = 0.25,
         event_fraction: float = 0.25,
         sweep_interval: int = 10,
+        trajectory_fraction: float = 0.10,
+        trajectory_short_weight: float = 2.0,
     ) -> None:
         self.online_buffer = online_buffer
         self.offline_buffer = offline_buffer
@@ -239,10 +239,12 @@ class EpisodeAwareMixer(DataMixer):
         self.success_fraction = success_fraction
         self.event_fraction = event_fraction
         self.sweep_interval = sweep_interval
+        self.trajectory_fraction = trajectory_fraction
+        self.trajectory_short_weight = trajectory_short_weight
         self.batch_count = 0
         self.pending_sweep: deque[tuple[int, int]] = deque()
 
-    def _priority_slots(self, count: int) -> list[int]:
+    def _trajectory_slots(self, count: int) -> list[int]:
         if count <= 0:
             return []
         if (
@@ -250,7 +252,9 @@ class EpisodeAwareMixer(DataMixer):
             and not self.pending_sweep
             and self.batch_count % self.sweep_interval == 0
         ):
-            record = self.index.choose_short_success(complete_only=True)
+            record = self.index.choose_short_success(
+                complete_only=True, short_weight=self.trajectory_short_weight
+            )
             if record is not None:
                 self.pending_sweep.extend((record.episode_id, slot) for slot in record.slots)
 
@@ -260,6 +264,12 @@ class EpisodeAwareMixer(DataMixer):
             if self.index._eligible(slot, episode_id):
                 slots.append(slot)
 
+        return slots
+
+    def _priority_slots(self, count: int) -> list[int]:
+        if count <= 0:
+            return []
+        slots: list[int] = []
         records = self.index.successful_episodes()
         if records:
             midpoint = median(record.path_length_m for record in records)
@@ -278,12 +288,15 @@ class EpisodeAwareMixer(DataMixer):
         n_online = batch_size if self.offline_buffer is None else max(1, int(batch_size * self.online_ratio))
         n_offline = batch_size - n_online
         n_priority = int(n_online * self.success_fraction)
+        n_trajectory = int(n_online * self.trajectory_fraction)
         priority_slots = self._priority_slots(n_priority)
+        trajectory_slots = self._trajectory_slots(n_trajectory)
 
-        n_uniform = n_online - len(priority_slots)
+        replay_slots = priority_slots + trajectory_slots
+        n_uniform = n_online - len(replay_slots)
         online_batch = self.online_buffer.sample(n_uniform) if n_uniform else None
-        if priority_slots:
-            priority_batch = self.online_buffer.sample(len(priority_slots), indices=priority_slots)
+        if replay_slots:
+            priority_batch = self.online_buffer.sample(len(replay_slots), indices=replay_slots)
             online_batch = (
                 concatenate_batch_transitions(online_batch, priority_batch)
                 if online_batch is not None
