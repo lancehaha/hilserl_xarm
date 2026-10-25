@@ -9,6 +9,40 @@ Train an xArm7 on a real-world task with LeRobot's [HIL-SERL](https://hil-serl.g
 
 Read [`docs/source/hilserl.mdx`](../../docs/source/hilserl.mdx) for the general method. This guide covers what is specific to the xArm setup.
 
+## Training experiment plan
+
+The first goal is to establish that the standard xArm HIL-SERL workflow learns the task. Keep the
+SAC learner and the existing sparse success reward fixed while comparing replay and data-collection
+choices. These ideas are inspired by [RAGEN's study of informative and diverse rollouts](https://arxiv.org/abs/2504.20073),
+but are adaptations for a physical robot, not a reproduction of RAGEN's PPO/GRPO method.
+
+1. **Define reproducible starts.** Mark a small, safe set of object starting poses within the
+   camera view and robot workspace. Record the start-pose ID, policy version, trial outcome,
+   intervention count, and episode length for each trial. Hold a few poses aside for evaluation.
+2. **Collect varied, fresh trials.** Rotate among the training poses rather than resetting to one
+   location. After policy updates, collect new trials with the current policy so replay continues
+   to include its present mistakes. Keep demonstrations and older trials available for coverage.
+3. **Use both replay routes.** Reserve separate shares of each online batch for (a) weighted
+   individual actions from successful attempts, including gripper command events, and (b) a sweep
+   through the transitions of one complete successful attempt. Select complete attempts with a
+   higher weight for the shorter half, while retaining longer successes. Start a new sweep at its
+   configured batch interval once the previous sweep has finished. Keep a uniform share for
+   failures and recovery states. Both routes still train SAC with one-step transition targets;
+   shorter trajectories receive sampling weight, not extra reward.
+4. **Try uncertain-start weighting only when data supports it.** For a start pose with several
+   trials, prioritize it modestly when outcomes are mixed (some successes and some failures).
+   Do not infer uncertainty from one attempt, and do not discard always-failing poses; they can
+   contain useful human recovery data. Record start-pose IDs in replay before implementing this
+   sampler, then compare it against the existing episode-aware mixer.
+5. **Evaluate with a frozen policy.** Run the same held-out start poses without intervention for
+   each training variant and report success rate as the primary metric. Also report trial count,
+   intervention count during training, and episode length. Use the same task and evaluation poses
+   for every variant so any difference can be attributed to the training change.
+
+This plan does not add intermediate grasp rewards or whole-trajectory policy optimization. Add
+those only as separate experiments if the basic setup works and there is a reliable grasp signal
+or evidence that one-step SAC fails to propagate the final success reward.
+
 ## How it works
 
 HIL-SERL learns **normalized end-effector deltas**: `[dx, dy, dz] ∈ [-1, 1]` plus a discrete gripper command `{0: close, 1: stay, 2: open}`. Each of these uses that same action format:
@@ -304,19 +338,26 @@ The actor runs the policy on the robot at 10 Hz and streams transitions to the l
 
 `train.json` also selects `mixer: episode_aware` for the **online half** of each
 batch. Once the reward classifier marks a completed attempt successful, the
-learner indexes its transitions and close/open gripper commands. It draws 25%
-of online samples from successful attempts, with twice the episode-selection
-weight for the shorter half of successes. Of those selected steps, 25% are
-drawn from gripper command changes when available. Every ten batches it begins
-covering every transition of one short, complete success across successive
-batches. The rest of the online half remains uniformly sampled, so failures
+learner indexes its transitions and close/open gripper commands. It reserves
+25% of online samples for individual actions from successful attempts, with
+twice the episode-selection weight for the shorter half of successes. Of those
+selected actions, 25% are drawn from gripper command changes when available.
+Separately, it reserves 10% of online samples for a sweep through one complete
+successful attempt; a new sweep can start every ten batches after the previous
+one finishes. Shorter complete attempts have twice the selection weight, while
+longer successes remain eligible. The rest of the online half remains uniformly sampled, so failures
 and recovery states remain available to SAC. These are replay weights, not
 extra rewards or sequence-model training. Shortness is measured by the end
 effector's traveled distance, so compare runs with similar task starts.
 
 To use the original uniform online/offline mix, set `mixer: online_offline`.
-The replay settings are `success_replay_fraction`, `event_replay_fraction`,
-and `episode_sweep_interval`; zero disables each respective emphasis. On
+The two routes can be adjusted independently with `success_replay_fraction`
+(individual-action share), `event_replay_fraction` (gripper event probability
+within that share), `trajectory_replay_fraction` (episode-sweep share),
+`trajectory_short_weight` (short-vs-long episode selection weight), and
+`episode_sweep_interval` (how often a new sweep can start). Set a replay fraction
+or the sweep interval to zero to disable its route. The two replay fractions
+must sum to at most one. On
 resume, saved episodes are indexed again from the replay dataset. Saved data
 does not retain whether an action was a human intervention, so that field is
 only recorded for new episodes.
