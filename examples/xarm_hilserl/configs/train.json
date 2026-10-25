@@ -29,6 +29,8 @@
   "success_replay_fraction": 0.25,
   "event_replay_fraction": 0.25,
   "episode_sweep_interval": 10,
+  "trajectory_replay_fraction": 0.10,
+  "trajectory_short_weight": 2.0,
   "policy": {
     "type": "gaussian_actor",
     "push_to_hub": false,
