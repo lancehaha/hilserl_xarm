@@ -45,7 +45,18 @@ or evidence that one-step SAC fails to propagate the final success reward.
 
 ## How it works
 
-HIL-SERL learns **normalized end-effector deltas**: `[dx, dy, dz] ∈ [-1, 1]` plus a discrete gripper command `{0: close, 1: stay, 2: open}`. Each of these uses that same action format:
+The setup follows [rail-berkeley/hil-serl](https://github.com/rail-berkeley/hil-serl) (`franka_env`, `RelativeFrame`, the `usb_pickup_insertion` / `ram_insertion` configs) as closely as the xArm allows:
+
+| hil-serl (Franka)                                                           | Here (xArm7)                                                                                                     |
+| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 7-D action: xyz, rotation vector, gripper, scaled by `ACTION_SCALE`         | Same: `end_effector_step_sizes` (m) and `end_effector_rot_step` (rad), discrete gripper                          |
+| `RelativeFrame`: actions in the end-effector frame                          | `action_frame: "ee"`; SpaceMouse interventions are converted to that frame before they are stored                |
+| State `tcp_pose` (relative to reset, Euler), `tcp_vel`, `tcp_force`, `tcp_torque`, `gripper_pose` | Same 19-D state (`relative_ee_frame`), force / torque from the UFACTORY Six-axis F/T sensor |
+| Cartesian impedance controller (2000 N/m), reference clipping              | Controller F/T admittance mode (2000 N/m, 20 Nm/rad, the SDK maximum) + `reference_clip`                         |
+| Stiff `PRECISION_PARAM` while resetting, compliant `COMPLIANCE_PARAM` after | Admittance off while homing; the F/T sensor is zeroed at the start pose, then admittance is switched on          |
+| `ABS_POSE_LIMIT_LOW/HIGH` safety box, `RANDOM_XY_RANGE`, `RANDOM_RZ_RANGE`  | `end_effector_bounds` (xyz + roll / pitch / yaw, roll by magnitude), `random_xy_range_m`, `random_rz_range_rad` |
+
+HIL-SERL learns **normalized end-effector deltas**: `[dx, dy, dz, drx, dry, drz] ∈ [-1, 1]` in the end-effector frame, plus a discrete gripper command `{0: close, 1: stay, 2: open}`. Each of these uses that same action format:
 
 - the policy;
 - the SpaceMouse;
@@ -55,28 +66,35 @@ HIL-SERL learns **normalized end-effector deltas**: `[dx, dy, dz] ∈ [-1, 1]` p
 The robot never sees a delta. On every step the action pipeline in `lerobot.rl.gym_manipulator` converts it into an absolute target:
 
 ```
-policy or SpaceMouse (while intervening)
-   │  [dx, dy, dz, gripper]                       ← stored in the replay buffer / dataset, learned by SAC
+SpaceMouse (base frame) ── TeleopDeltaToEEFrameStep ──┐ (while intervening)
+policy ───────────────────────────────────────────────┤
+   │  [dx, dy, dz, drx, dry, drz, gripper], EE frame   ← stored in the replay buffer / dataset, learned by SAC
    ▼
 CartesianDeltaToTargetStep
-   │  target = reference pose + delta × end_effector_step_sizes, clipped to end_effector_bounds
+   │  delta rotated into the base frame
+   │  position = measured + delta × end_effector_step_sizes
+   │  rotation = Rotation.from_rotvec(delta_rot × end_effector_rot_step) * measured
+   │  clipped to end_effector_bounds, then to reference_clip around the measured pose
    ▼
-XArm.send_action({"ee.x", "ee.y", "ee.z", "gripper.pos"})     ← absolute target, meters, robot base frame
+XArm.send_action({"ee.x", "ee.y", "ee.z", "ee.rx", "ee.ry", "ee.rz", "gripper.pos"})  ← absolute target, base frame
    ▼
-xArm controller (online Cartesian trajectory planning, mode 7) does the inverse kinematics
+xArm controller (online Cartesian trajectory planning, mode 7, with F/T admittance) does the inverse kinematics
 ```
 
-This is the same pipeline LeRobot uses for the SO-100 with a gamepad, except for one step. The SO arm needs URDF inverse kinematics; the xArm controller tracks Cartesian targets itself. Orientation stays fixed (3-DoF control). The gripper is binary: "stay" keeps the last open/close command, so a grasp keeps squeezing.
+`ee.rx / ry / rz` are the xArm roll / pitch / yaw in radians. The gripper is binary: "stay" keeps the last open/close command, so a grasp keeps squeezing.
+
+The policy state (`observation.state`, 19 values) is built by `EERelativeObservationStep` from `XArm.get_observation`: TCP pose relative to the pose after the reset (xyz, then roll / pitch / yaw), TCP twist in the end-effector frame (finite difference), external force and torque in the base frame, gripper opening. The reward classifier only sees the camera images.
 
 Code involved:
 
 | What                                           | Where                                                                           |
 | ---------------------------------------------- | ------------------------------------------------------------------------------- |
 | xArm robot (`--robot.type=xarm`)               | `src/lerobot/robots/xarm/xarm.py`, `config_xarm.py`                             |
-| Delta → Cartesian target step                  | `src/lerobot/robots/xarm/robot_cartesian_processor.py`                          |
+| Delta → Cartesian target, EE frame, relative state | `src/lerobot/robots/xarm/robot_cartesian_processor.py`                      |
 | HIL-SERL env, recording                        | `src/lerobot/rl/gym_manipulator.py` (generalized to robots without a motor bus) |
 | SpaceMouse teleop (`--teleop.type=spacemouse`) | `src/lerobot/teleoperators/space_mouse/`                                        |
 | Teleop + bounds tool, policy evaluation        | `examples/xarm_hilserl/teleoperate.py`, `eval_policy.py`                        |
+| F/T sensor and admittance checks               | `examples/xarm_hilserl/probe_admittance.py`                                     |
 | Configs                                        | `examples/xarm_hilserl/configs/`                                                |
 
 ## Hardware and I/O sources
@@ -84,8 +102,9 @@ Code involved:
 | Device                                                               | Interface                         | Library           | Used for                                                                      |
 | -------------------------------------------------------------------- | --------------------------------- | ----------------- | ----------------------------------------------------------------------------- |
 | xArm7 + control box                                                  | Ethernet, `192.168.1.235`         | `xarm-python-sdk` | Arm motion, TCP pose                                                          |
+| UFACTORY Six-axis F/T sensor (between flange and gripper)            | Tool bus, through the xArm SDK    | `xarm-python-sdk` | Force / torque state, admittance (compliance) control                         |
 | xArm Gripper                                                         | Tool Modbus, through the xArm SDK | `xarm-python-sdk` | Open / close, opening read-back                                               |
-| 3Dconnexion SpaceMouse Compact                                       | USB HID (`/dev/hidraw*`)          | `pyspacemouse`    | Arm xyz motion + gripper buttons                                              |
+| 3Dconnexion SpaceMouse Compact                                       | USB HID (`/dev/hidraw*`)          | `pyspacemouse`    | Arm xyz + rotation + gripper buttons                                          |
 | Intel RealSense D435i, on the wrist (serial `134322070906`)          | USB 3                             | `pyrealsense2`    | `wrist` image: close view of the gripper and object (RGB, depth not used)     |
 | Intel RealSense D405, fixed beside the table (serial `261122273645`) | USB 3                             | `pyrealsense2`    | `side` image: the whole scene, so the object is visible wherever it is placed |
 | Keyboard                                                             | X11 session                       | `pynput`          | Intervention, success / failure, re-record                                    |
@@ -131,6 +150,15 @@ Code involved:
    - **TCP offset and payload** of the xArm Gripper, so the reported pose is the fingertip and collision detection is accurate.
    - **Safety boundary**: slightly larger than the soft box (`end_effector_bounds`) you'll find in step 1.
    - **Collision sensitivity** and **self-collision detection**.
+5. **F/T sensor.** Run the sensor **load identification** in UFACTORY Studio (Settings → F/T sensor) with the gripper mounted. The arm moves through several poses on its own, so clear the workspace. Identification resets the TCP payload and collision sensitivity: set both again afterwards. Then check the sensor with the arm stiff:
+
+   ```bash
+   uv run python examples/xarm_hilserl/probe_admittance.py status   # sensor error 0, compensated force ≈ 0 N at rest
+   uv run python examples/xarm_hilserl/probe_admittance.py frame    # push the gripper: +X → +Fx; up → -Fz (tool frame)
+   uv run python examples/xarm_hilserl/probe_admittance.py track    # admittance on: a ~20 N push moves the arm ~1 cm, it comes back
+   ```
+
+   `ft_ext_force` is in the tool frame (with the gripper pointing down, pushing up reads -Fz). `robot.ft_sensor_frame: "tool"` uses it as is, as hil-serl does with the Franka `K_F_ext_hat_K`; `"base"` rotates it into the base frame. Datasets recorded before this change have base-frame force, convert them with `convert_ft_frame.py`. The sensor is zeroed after every reset, so a contact or cable pull at reset time shifts the zero for the whole episode.
 
 ## Controls reference
 
@@ -139,6 +167,7 @@ Code involved:
 | Input            | Action                                                                                                                                        |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | Puck translation | Move the TCP in x / y / z of the robot base frame (+X out of the front of the base, +Y to its left, +Z up). Remap with `teleop.axis_mapping`. |
+| Puck tilt / twist | Rotate the TCP about the base x / y / z axes (`teleop.use_rotation`). The rotation follows `teleop.axis_mapping`: tilting / twisting the puck about the axis you push along rotates the TCP about the robot axis that push moves along. Override with `teleop.rotation_mapping`; small tilts below `teleop.rotation_deadzone` are ignored. |
 | Left button      | Close the gripper (stays closed)                                                                                                              |
 | Right button     | Open the gripper (stays open)                                                                                                                 |
 
@@ -173,25 +202,31 @@ The robot / workspace values live in both `env.json` and `train.json` (one confi
 uv run python examples/xarm_hilserl/teleoperate.py \
     --robot.cameras='{wrist: {type: intelrealsense, serial_number_or_name: "134322070906", width: 640, height: 480, fps: 30}}' \
     --home_joints_deg='[62, -19.8, 42, 40.1, 18.5, 54.2, 1.6]' \
-    --write_configs=true
+    --teleop.use_rotation=true --robot.use_ft_sensor=true --robot.use_admittance=true \
+    --end_effector_rot_step=0.06 \
+    --reference_clip='{min: [-0.01, -0.01, -0.01, -0.05, -0.05, -0.05], max: [0.01, 0.01, 0.01, 0.05, 0.05, 0.05]}' \
+    --write_configs=true \
+    --display_data=true
+
 ```
 
 The arm first moves to `--home_joints_deg` (here UFACTORY's ready pose; omit it to start where the arm is). A status line shows the live TCP and the min/max visited so far. The arm only moves while you push the puck, inside a ±30 cm box around the start pose (`--box_m`, or an explicit `--end_effector_bounds`). Add `--display_data=true` to see the wrist camera and TCP in Rerun.
 
-1. **Axis mapping.** Push the puck forward, left and up; the TCP should move +X, +Y, +Z. If not, fix `--teleop.axis_mapping` (e.g. `'[y, -x, z]'`), then set the same `env.teleop.axis_mapping` in `env.json` and `train.json`.
-2. **Step size.** `--end_effector_step_sizes` is the distance moved per step at full deflection (default 1 cm = 10 cm/s at 10 Hz). Pick values that are precise enough for the task. **Freeze them now**: demos store normalized actions, so changing the step size later changes what the demos mean.
-3. **Workspace and home.**
+To try contacts as they will behave in HIL-SERL, add `--robot.use_admittance=true` and the same `--reference_clip` as in the configs, e.g. `--reference_clip='{min: [-0.01, -0.01, -0.01, -0.05, -0.05, -0.05], max: [0.01, 0.01, 0.01, 0.05, 0.05, 0.05]}'`. The arm then gives way when it is pushed or blocked, and the status line shows the force. The F/T sensor is zeroed at the start pose, so don't touch the gripper while the script starts.
+
+1. **Axis mapping.** Push the puck forward, left and up; the TCP should move +X, +Y, +Z. If not, fix `--teleop.axis_mapping` (e.g. `'[y, -x, z]'`), then set the same `env.teleop.axis_mapping` in `env.json` and `train.json`. Rotation follows the same mapping, so it needs no separate setup. Override it only if you want something else, with `--teleop.rotation_mapping` (`roll` / `pitch` / `yaw` = rotation about the puck x / y / z, e.g. `'[-pitch, roll, yaw]'`).
+2. **Step size.** `--end_effector_step_sizes` is the distance moved per step at full deflection (default 1 cm = 10 cm/s at 10 Hz), `--end_effector_rot_step` the rotation (0.06 rad, as hil-serl's `ram_insertion`). Pick values that are precise enough for the task. **Freeze them now**: demos store normalized actions, so changing the step size later changes what the demos mean.
+3. **Workspace and home.** The pose the script starts from (`--home_joints_deg`, or where the arm is) becomes the home of every episode.
    - Move the TCP over the whole region the task needs: every corner, highest and lowest point.
-   - Finish at the pose every episode should start from.
-   - Press Ctrl+C.
+   - Press Ctrl+C, wherever the arm is.
 
 On exit the script prints the values it found:
 
-- `env.processor.inverse_kinematics`: `end_effector_bounds` (the visited box), step sizes, `delta_reference`;
-- `env.processor.reset.fixed_reset_joint_positions`: the current joints, the home pose of every episode;
-- `policy.dataset_stats` (derived from the box and step sizes).
+- `env.processor.inverse_kinematics`: `end_effector_bounds` (xyz: the box you visited; |roll|, pitch, yaw: ±`--box_rad` around the start pose, the home of every episode), step sizes, `delta_reference`;
+- `env.processor.reset.fixed_reset_joint_positions`: the joints at the start, the home pose of every episode;
+- `policy.dataset_stats` for the 19-D state: the visited pose relative to the home, the twist at full deflection, ±`--force_range_n` / `--torque_range_nm`, the gripper.
 
-With `--write_configs=true` it then asks `Write these values into …env.json, …train.json? [y/N]`. Answer `y` only after a good run: a run that ended in an error or a bad final pose should not overwrite your configs. Without the flag, nothing is written.
+With `--write_configs=true` it then asks `Write these values into …env.json, …train.json? [y/N]`. Answer `y` only after a good run: a run that ended in an error or did not cover the workspace should not overwrite your configs. Without the flag, nothing is written.
 
 To edit the configs by hand instead, the printed values go here:
 
@@ -201,7 +236,7 @@ To edit the configs by hand instead, the printed values go here:
 | `fixed_reset_joint_positions`                                       | `env.processor.reset.fixed_reset_joint_positions` (only this key; keep `reset_time_s` etc.) | same path              |
 | `policy.dataset_stats`                                              | not used                                                                                    | `policy.dataset_stats` |
 
-`env.processor.observation` holds observation-processing options (e.g. `add_joint_velocity_to_observation`), not stats; leave it as is. Later steps fill two more fields in both files: the crop in `env.processor.image_preprocessing` (step 4) and the classifier checkpoint in `env.processor.reward_classifier.pretrained_path` (step 5).
+`env.processor.observation` holds observation-processing options, not stats: keep `relative_ee_frame: true` and `add_joint_velocity_to_observation: false` (the state already has the TCP twist). Later steps fill two more fields in both files: the crop in `env.processor.image_preprocessing` (step 4) and the classifier checkpoint in `env.processor.reward_classifier.pretrained_path` (step 5).
 
 Then set the Studio safety boundary a few centimeters outside the box.
 
@@ -235,8 +270,7 @@ This runs exactly the loop used for recording and training, with no policy:
 ### 3. Record demonstrations
 
 ```bash
-uv run python -m lerobot.rl.gym_manipulator --config_path examples/xarm_hilserl/configs/env.json \
-    --mode=record --dataset.task="<what the robot should do>"
+uv run python -m lerobot.rl.gym_manipulator --config_path examples/xarm_hilserl/configs/env.json --mode=record
 ```
 
 For each episode:
@@ -247,11 +281,11 @@ For each episode:
 
 Press **`r`** to discard an attempt that went wrong: like rail-berkeley/hil-serl, keep only successful demos (about 20, `num_episodes_to_record`).
 
-The dataset is written to `~/.cache/huggingface/lerobot/local/xarm7_hilserl_demos`, with both camera images at full resolution so step 4 can crop them. Demos must contain every camera the policy uses: after adding, removing or moving a camera, record them again.
+The dataset is written to `~/.cache/huggingface/lerobot/local/xarm7_hilserl_demos_6dof_ft`, with both camera images at full resolution so step 4 can crop them. Demos must contain every camera the policy uses: after adding, removing or moving a camera, record them again.
 
 ### 4. Crop and resize the demo images
 
-**This step is always needed, even if you keep the full frame.** The policy takes 128×128 images (`[3, 128, 128]` in `train.json`) but the demos were recorded at 640×480. `crop_dataset_roi` writes the 128×128 copy, `local/xarm7_hilserl_demos_cropped_resized`, which the learner loads as the offline dataset. **Choosing a smaller box is optional.**
+**This step is always needed, even if you keep the full frame.** The policy takes 128×128 images (`[3, 128, 128]` in `train.json`) but the demos were recorded at 640×480. `crop_dataset_roi` writes the 128×128 copy, `local/xarm7_hilserl_demos_6dof_ft_cropped_resized`, which the learner loads as the offline dataset. **Choosing a smaller box is optional.**
 
 Pick a box per camera:
 
@@ -265,7 +299,7 @@ Keep boxes roughly square, because they are resized to 128×128. The full 640×4
 **Option A: draw the boxes.** The crop tool needs OpenCV with window support. lerobot installs the windowless build, so add the GUI build for this command only:
 
 ```bash
-uv run --with "opencv-python>=4.12,<4.14" python -m lerobot.rl.crop_dataset_roi --repo-id local/xarm7_hilserl_demos
+uv run --with "opencv-python>=4.12,<4.14" python -m lerobot.rl.crop_dataset_roi --repo-id local/xarm7_hilserl_demos_6dof_ft
 ```
 
 It shows the first frame of each camera in turn. Draw a rectangle and press `c` for each. It prints the boxes as `[top, left, height, width]` in camera pixels and writes the 128×128 dataset.
@@ -274,7 +308,7 @@ It shows the first frame of each camera in turn. Draw a rectangle and press `c` 
 
 ```bash
 echo '{"observation.images.wrist": [0, 0, 480, 640], "observation.images.side": [0, 0, 480, 640]}' > /tmp/crop.json
-uv run python -m lerobot.rl.crop_dataset_roi --repo-id local/xarm7_hilserl_demos --crop-params-path /tmp/crop.json
+uv run python -m lerobot.rl.crop_dataset_roi --repo-id local/xarm7_hilserl_demos_6dof_ft --crop-params-path /tmp/crop.json
 ```
 
 Then put the same boxes into `env.processor.image_preprocessing` of both configs, so live images are processed exactly like the demos:
@@ -291,7 +325,7 @@ The classifier detects success from the camera images (both cameras); it gives t
 ```bash
 uv run python -m lerobot.rl.gym_manipulator --config_path examples/xarm_hilserl/configs/env.json \
     --mode=record --dataset.repo_id=local/xarm7_hilserl_classifier --dataset.num_episodes_to_record=15 \
-    --env.processor.reset.terminate_on_success=false --dataset.task="<what the robot should do>"
+    --env.processor.reset.terminate_on_success=false
 ```
 
 For each episode (`terminate_on_success=false`, so episodes don't end on success):

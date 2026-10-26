@@ -56,6 +56,9 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     use_backup_entropy: bool = True
     # Weight for the critic target update
     critic_target_update_weight: float = 0.005
+    # Give the target critics their own Polyak-averaged copy of the observation encoder
+    # (as rail-berkeley/hil-serl) instead of sharing the online encoder
+    use_target_encoder: bool = False
 
     # Critic ensemble
     # Number of critics in the ensemble
@@ -70,6 +73,10 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     # Temperature / entropy
     # Initial temperature value
     temperature_init: float = 1.0
+    # Temperature parameterization: alpha = exp(p) or softplus(p) (as rail-berkeley/hil-serl)
+    temperature_parameterization: str = "exp"
+    # Compute the entropy of the temperature loss at the next observations (as rail-berkeley/hil-serl)
+    temperature_uses_next_observations: bool = False
     # Target entropy for automatic temperature tuning. If ``None``, defaults to
     # ``-|A|/2`` where ``|A|`` is the total action dimension (continuous + 1 if
     # there is a discrete action head).
@@ -80,8 +87,14 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
     utd_ratio: int = 1
     # Frequency of policy updates
     policy_update_freq: int = 1
-    # Gradient clipping norm for the SAC algorithm
-    grad_clip_norm: float = 40.0
+    # Take the gradients of all the losses of an update at the same parameters, then step every optimizer
+    # (as rail-berkeley/hil-serl), instead of stepping critic, discrete critic, actor and temperature in turn.
+    # The actor is then updated once every `policy_update_freq` updates.
+    simultaneous_updates: bool = False
+    # Gradient clipping norm for the SAC algorithm, `None` to disable (as rail-berkeley/hil-serl)
+    grad_clip_norm: float | None = 40.0
+    # How the actor loss reduces the critic ensemble: "min" or "mean" (as rail-berkeley/hil-serl)
+    actor_q_reduction: str = "min"
 
     # Optimizations
     # torch.compile is currently disabled by default
@@ -89,6 +102,15 @@ class SACAlgorithmConfig(RLAlgorithmConfig):
 
     # Policy config
     policy_config: PreTrainedConfig | None = None
+
+    def __post_init__(self):
+        if self.actor_q_reduction not in ("min", "mean"):
+            raise ValueError(f"`actor_q_reduction` must be 'min' or 'mean', got '{self.actor_q_reduction}'.")
+        if self.temperature_parameterization not in ("exp", "softplus"):
+            raise ValueError(
+                "`temperature_parameterization` must be 'exp' or 'softplus', "
+                f"got '{self.temperature_parameterization}'."
+            )
 
     @classmethod
     def from_policy_config(cls, policy_cfg: GaussianActorConfig) -> SACAlgorithmConfig:

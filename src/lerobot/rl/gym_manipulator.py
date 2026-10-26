@@ -66,7 +66,12 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     GripperVelocityToJoint,
     InverseKinematicsRLStep,
 )
-from lerobot.robots.xarm.robot_cartesian_processor import CartesianDeltaToTargetStep, RobotActionToTensorStep
+from lerobot.robots.xarm.robot_cartesian_processor import (
+    CartesianDeltaToTargetStep,
+    EERelativeObservationStep,
+    RobotActionToTensorStep,
+    TeleopDeltaToEEFrameStep,
+)
 from lerobot.teleoperators import (
     gamepad,  # noqa: F401
     keyboard,  # noqa: F401
@@ -134,6 +139,7 @@ class RobotEnv(gym.Env):
         reset_pose: list[float] | None = None,
         reset_time_s: float = 5.0,
         control_period_s: float | None = None,
+        use_rotation: bool = False,
     ) -> None:
         """Initialize robot environment with configuration options.
 
@@ -146,6 +152,7 @@ class RobotEnv(gym.Env):
             control_period_s: If set, `step` waits after sending the action until this long has passed since
                 the start of the step before observing, as in rail-berkeley/hil-serl. The next observation
                 then shows the effect of the action instead of the motion caused by the previous one.
+            use_rotation: Whether the action holds rotation deltas (6-DoF end-effector control).
         """
         super().__init__()
 
@@ -175,6 +182,7 @@ class RobotEnv(gym.Env):
         self.control_period_s = control_period_s
 
         self.use_gripper = use_gripper
+        self.use_rotation = use_rotation
 
         self._raw_joint_positions = None
 
@@ -218,7 +226,7 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
+        action_dim = 6 if self.use_rotation else 3
         bounds = {}
         bounds["min"] = -np.ones(action_dim)
         bounds["max"] = np.ones(action_dim)
@@ -379,6 +387,7 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     )
     reset_pose = cfg.processor.reset.fixed_reset_joint_positions if cfg.processor.reset is not None else None
     reset_time_s = cfg.processor.reset.reset_time_s if cfg.processor.reset is not None else 5.0
+    ik_cfg = cfg.processor.inverse_kinematics
 
     env = RobotEnv(
         robot=robot,
@@ -387,6 +396,7 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         reset_pose=reset_pose,
         reset_time_s=reset_time_s,
         control_period_s=1.0 / cfg.fps if cfg.fps else None,
+        use_rotation=ik_cfg is not None and ik_cfg.use_rotation,
     )
 
     return env, teleop_device
@@ -478,6 +488,8 @@ def make_processors(
                 motor_names=motor_names,
             )
         )
+    if cfg.processor.observation is not None and cfg.processor.observation.relative_ee_frame:
+        env_pipeline_steps.append(EERelativeObservationStep())
 
     if cfg.processor.image_preprocessing is not None:
         env_pipeline_steps.append(
@@ -524,11 +536,16 @@ def make_processors(
     env_pipeline_steps.append(AddBatchDimensionProcessorStep())
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
-    action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
+    use_rotation = native_cartesian and ik_cfg.use_rotation
+    action_pipeline_steps = [AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device)]
+    if native_cartesian and ik_cfg.action_frame == "ee":
+        # Interventions are recorded in the policy's (end-effector) action frame.
+        action_pipeline_steps.append(TeleopDeltaToEEFrameStep())
+    action_pipeline_steps += [
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
+            use_rotation=use_rotation,
             terminate_on_success=terminate_on_success,
         ),
     ]
@@ -576,13 +593,18 @@ def make_processors(
                 MapTensorToDeltaActionDictStep(
                     use_gripper=cfg.processor.gripper.use_gripper
                     if cfg.processor.gripper is not None
-                    else False
+                    else False,
+                    use_rotation=use_rotation,
                 ),
                 MapDeltaActionToRobotActionStep(),
                 CartesianDeltaToTargetStep(
                     end_effector_step_sizes=ik_cfg.end_effector_step_sizes,
                     end_effector_bounds=ik_cfg.end_effector_bounds,
                     delta_reference=ik_cfg.delta_reference,
+                    use_rotation=use_rotation,
+                    end_effector_rot_step=ik_cfg.end_effector_rot_step or 0.0,
+                    action_frame=ik_cfg.action_frame,
+                    reference_clip=ik_cfg.reference_clip,
                 ),
                 RobotActionToTensorStep(action_keys=list(env.robot.action_features)),
             ]
@@ -705,6 +727,10 @@ def control_loop(
 
     # Determine if gripper is used
     use_gripper = cfg.env.processor.gripper.use_gripper if cfg.env.processor.gripper is not None else True
+    ik_cfg = cfg.env.processor.inverse_kinematics
+    delta_names = ["delta_x", "delta_y", "delta_z"]
+    if ik_cfg is not None and ik_cfg.use_rotation:
+        delta_names += ["delta_rx", "delta_ry", "delta_rz"]
 
     dataset = None
     if cfg.mode == "record":
@@ -713,8 +739,8 @@ def control_loop(
         else:
             action_features = {
                 "dtype": "float32",
-                "shape": (4,),
-                "names": ["delta_x", "delta_y", "delta_z", "gripper"],
+                "shape": (len(delta_names) + 1,),
+                "names": [*delta_names, "gripper"],
             }
         features = {
             ACTION: action_features,
@@ -764,7 +790,7 @@ def control_loop(
             step_start_time = time.perf_counter()
 
             # Create a neutral action (no movement)
-            neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+            neutral_action = torch.zeros(len(delta_names), dtype=torch.float32)
             if use_gripper:
                 neutral_action = torch.cat([neutral_action, torch.tensor([1.0])])  # Gripper stay
 

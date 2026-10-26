@@ -123,6 +123,57 @@ class Rotation:
         """
         return cls(quat)
 
+    @classmethod
+    def from_euler(cls, seq: str, angles: np.ndarray) -> "Rotation":
+        """
+        Create rotation from Euler angles.
+
+        Args:
+            seq: Only "xyz" (extrinsic rotations about the fixed X, Y, Z axes: R = Rz @ Ry @ Rx) is supported,
+                as scipy's lowercase "xyz". These are the roll / pitch / yaw used by e.g. UFACTORY xArm.
+            angles: [x, y, z] angles in radians
+
+        Returns:
+            Rotation instance
+        """
+        if seq != "xyz":
+            raise NotImplementedError(f"Only the extrinsic 'xyz' sequence is supported, got '{seq}'.")
+        roll, pitch, yaw = (float(angle) for angle in angles)
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        matrix = np.array(
+            [
+                [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                [-sp, cp * sr, cp * cr],
+            ]
+        )
+        return cls.from_matrix(matrix)
+
+    def as_euler(self, seq: str) -> np.ndarray:
+        """
+        Convert rotation to Euler angles.
+
+        Args:
+            seq: Only "xyz" (extrinsic, see `from_euler`) is supported.
+
+        Returns:
+            [x, y, z] angles in radians, x and z in [-pi, pi], y in [-pi/2, pi/2]
+        """
+        if seq != "xyz":
+            raise NotImplementedError(f"Only the extrinsic 'xyz' sequence is supported, got '{seq}'.")
+        matrix = self.as_matrix()
+        pitch = -np.arcsin(np.clip(matrix[2, 0], -1.0, 1.0))
+        if abs(matrix[2, 0]) < 1.0 - 1e-9:
+            roll = np.arctan2(matrix[2, 1], matrix[2, 2])
+            yaw = np.arctan2(matrix[1, 0], matrix[0, 0])
+        else:
+            # Gimbal lock: only roll - yaw (or roll + yaw) is defined, put it all in yaw.
+            roll = 0.0
+            yaw = np.arctan2(-matrix[0, 1], matrix[1, 1])
+        return np.array([roll, pitch, yaw])
+
     def as_matrix(self) -> np.ndarray:
         """
         Convert rotation to 3x3 rotation matrix.

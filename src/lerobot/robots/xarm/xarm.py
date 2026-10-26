@@ -31,6 +31,7 @@ from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import _xarm_available, require_package
+from lerobot.utils.rotation import Rotation
 
 from ..robot import Robot
 from .config_xarm import XArmConfig
@@ -42,27 +43,44 @@ if TYPE_CHECKING or _xarm_available:
 logger = logging.getLogger(__name__)
 
 EE_POSITION_KEYS = ("ee.x", "ee.y", "ee.z")
+# xArm roll / pitch / yaw in radians: fixed-axis X, Y, Z rotations, i.e. scipy's extrinsic "xyz" Euler angles.
+EE_ORIENTATION_KEYS = ("ee.rx", "ee.ry", "ee.rz")
+EE_POSE_KEYS = EE_POSITION_KEYS + EE_ORIENTATION_KEYS
+# TCP twist in the base frame (m/s, rad/s), as `tcp_vel` in rail-berkeley/hil-serl.
+EE_VELOCITY_KEYS = ("ee.vx", "ee.vy", "ee.vz", "ee.wx", "ee.wy", "ee.wz")
+# External force (N) and torque (Nm) on the TCP in the base frame, as `tcp_force` / `tcp_torque`.
+FORCE_KEYS = ("ft.fx", "ft.fy", "ft.fz")
+TORQUE_KEYS = ("ft.tx", "ft.ty", "ft.tz")
 GRIPPER_KEY = "gripper.pos"
 
 # xArm controller modes and states, see the xArm SDK documentation.
 POSITION_MODE = 0
 ONLINE_CARTESIAN_MODE = 7
 READY_STATE = 0
+FT_NON_FORCE_MODE = 0
+FT_ADMITTANCE_MODE = 1
 
 MM_PER_M = 1000.0
 _MODE_SWITCH_TIMEOUT_S = 2.0
 _RECOVERY_ATTEMPTS = 3
 _RECOVERY_WAIT_S = 1.0
+# Settling times from the UFACTORY F/T sensor examples.
+_FT_ENABLE_WAIT_S = 0.5
+_FT_ZERO_WAIT_S = 0.2
 
 
 class XArm(Robot):
     """
     UFACTORY xArm with an xArm Gripper, controlled in Cartesian end-effector space.
 
-    Observations are the measured TCP position in the robot base frame (meters) and the normalized gripper
-    opening (0 = open, 1 = closed). Actions are absolute TCP position targets plus a gripper target; the
-    controller's online trajectory planning mode (mode 7) does the inverse kinematics. The TCP orientation is
-    held at the orientation measured at connection / the last reset.
+    Observations are the measured TCP pose in the robot base frame (meters, xArm roll / pitch / yaw in
+    radians), the TCP twist (finite difference of consecutive readings), optionally the external force and
+    torque from the Six-axis F/T sensor (base frame), and the normalized gripper opening (0 = open, 1 =
+    closed). Actions are absolute TCP pose targets plus a gripper target; the controller's online trajectory
+    planning mode (mode 7) does the inverse kinematics.
+
+    With `use_admittance`, the controller's F/T admittance control makes the arm compliant during episodes,
+    like the Cartesian impedance controller of rail-berkeley/hil-serl. It is switched off while resetting.
 
     Controller-side safety (safety boundary, collision sensitivity, self-collision detection, TCP offset and
     payload) is left to UFACTORY Studio. Controller errors are reported through `has_fault`; `reset_to_home`
@@ -79,7 +97,8 @@ class XArm(Robot):
         self.arm: XArmAPI | None = None
         self.cameras = make_cameras_from_configs(config.cameras)
         self._rng = np.random.default_rng()
-        self._hold_rpy_deg: list[float] = [180.0, 0.0, 0.0]
+        # Previous (time, position, orientation) reading, for the finite-difference TCP twist.
+        self._last_pose_reading: tuple[float, np.ndarray, Rotation] | None = None
         self._last_gripper_target: float | None = None
         self._last_gripper_obs = 0.0
 
@@ -95,11 +114,15 @@ class XArm(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self.action_features, **self._cameras_ft}
+        state_keys = [*EE_POSE_KEYS, *EE_VELOCITY_KEYS]
+        if self.config.use_ft_sensor:
+            state_keys += [*FORCE_KEYS, *TORQUE_KEYS]
+        return {**dict.fromkeys(state_keys, float), GRIPPER_KEY: float, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return {**dict.fromkeys(EE_POSITION_KEYS, float), GRIPPER_KEY: float}
+        # The gripper stays last: the discrete gripper critic and the gripper penalty expect it there.
+        return {**dict.fromkeys(EE_POSE_KEYS, float), GRIPPER_KEY: float}
 
     @property
     def is_connected(self) -> bool:
@@ -144,7 +167,11 @@ class XArm(Robot):
         self._check(self._api.set_gripper_enable(True), "set_gripper_enable")
         self._check(self._api.set_gripper_mode(0), "set_gripper_mode")
         self._check(self._api.set_gripper_speed(self.config.gripper_speed), "set_gripper_speed")
-        self._hold_current_orientation()
+        if self.config.use_ft_sensor:
+            self._start_ft_sensor()
+        if self.config.use_admittance:
+            self._configure_admittance()
+        # Stiff until the first `reset_to_home`, which switches compliance on at the start pose.
         self._set_mode(ONLINE_CARTESIAN_MODE)
 
         for cam in self.cameras.values():
@@ -165,55 +192,75 @@ class XArm(Robot):
         Clear any controller error and move (blocking) to the home joint configuration, then open the gripper.
 
         A joint-space home keeps the redundant joints of the arm from drifting across episodes. When
-        `random_xy_range_m` is set, a uniform random xy offset is then added to the home TCP position.
+        `random_xy_range_m` / `random_rz_range_rad` are set, a uniform random xy / yaw offset is then added to
+        the home TCP pose. As `go_to_reset` in rail-berkeley/hil-serl, the arm is stiff while resetting; the
+        F/T sensor is zeroed at the start pose and admittance control is switched back on afterwards.
 
         Args:
             joints_deg: Home joint angles in degrees. If `None`, the arm stays where it is.
         """
         # Right after a collision the controller can raise the error again on the first move, so retry.
         for attempt in range(1, _RECOVERY_ATTEMPTS + 1):
-            self._enable_motion()
-            self._set_mode(POSITION_MODE)
-            if joints_deg is None:
+            code, api = self._try_reset_to_home(joints_deg)
+            if code == 0 and not self.has_fault:
                 break
+            if attempt == _RECOVERY_ATTEMPTS:
+                self._check(code or -1, api)
+            logger.warning(
+                f"{self} homing failed (`{api}` code {code}, attempt {attempt}/{_RECOVERY_ATTEMPTS}), "
+                f"retrying. {self.fault_description}"
+            )
+            time.sleep(_RECOVERY_WAIT_S)
+
+        self._last_gripper_target = 0.0
+        self._last_pose_reading = None
+        # F/T sensor commands leave the controller paused (state 5), so they come before `_set_mode`, which sets
+        # it ready again. Otherwise motion commands are ignored (only the gripper, on its own bus, moves).
+        if self.config.use_ft_sensor:
+            self._zero_ft_sensor()
+        if self.config.use_admittance:
+            self._set_ft_mode(FT_ADMITTANCE_MODE)
+        self._set_mode(ONLINE_CARTESIAN_MODE)
+
+    def _try_reset_to_home(self, joints_deg: Sequence[float] | None) -> tuple[int, str]:
+        """One homing attempt. Returns the first non-zero SDK code (or 0) and the API that returned it."""
+        self._enable_motion()
+        if self.config.use_admittance:
+            self._set_ft_mode(FT_NON_FORCE_MODE)
+        self._set_mode(POSITION_MODE)
+        if joints_deg is not None:
             code = self._api.set_servo_angle(
                 angle=list(joints_deg),
                 speed=self.config.home_joint_speed_deg_s,
                 is_radian=False,
                 wait=True,
             )
-            if code == 0 and not self.has_fault:
-                break
-            if attempt == _RECOVERY_ATTEMPTS:
-                self._check(code or -1, "set_servo_angle")
-            logger.warning(
-                f"{self} homing failed (code {code}, attempt {attempt}/{_RECOVERY_ATTEMPTS}), retrying. "
-                f"{self.fault_description}"
-            )
-            time.sleep(_RECOVERY_WAIT_S)
+            if code != 0:
+                return code, "set_servo_angle"
 
-        if self.config.random_xy_range_m > 0:
+        if self.config.random_xy_range_m > 0 or self.config.random_rz_range_rad > 0:
             dx, dy = self._rng.uniform(-self.config.random_xy_range_m, self.config.random_xy_range_m, size=2)
+            dyaw = self._rng.uniform(-self.config.random_rz_range_rad, self.config.random_rz_range_rad)
+            # A relative yaw is a rotation about the base Z axis, as hil-serl's `euler_random[-1] += ...`.
             code = self._api.set_position(
                 x=dx * MM_PER_M,
                 y=dy * MM_PER_M,
                 z=0,
                 roll=0,
                 pitch=0,
-                yaw=0,
+                yaw=np.degrees(dyaw),
                 relative=True,
                 speed=self.config.max_linear_speed_mm_s,
                 is_radian=False,
                 wait=True,
             )
-            self._check(code, "set_position")
+            if code != 0:
+                return code, "set_position"
 
-        self._check(
-            self._api.set_gripper_position(self.config.gripper_open_pos, wait=True), "set_gripper_position"
-        )
-        self._last_gripper_target = 0.0
-        self._hold_current_orientation()
-        self._set_mode(ONLINE_CARTESIAN_MODE)
+        # The moves above already waited for the arm. By default the SDK also waits for the arm before moving
+        # the gripper, and that wait returns -9 (`EMERGENCY_STOP`) on a controller left stopped by a fault.
+        code = self._api.set_gripper_position(self.config.gripper_open_pos, wait=True, wait_motion=False)
+        return code, "set_gripper_position"
 
     @check_if_not_connected
     def get_joint_positions(self) -> list[float]:
@@ -225,9 +272,26 @@ class XArm(Robot):
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         start = time.perf_counter()
-        code, pose = self._api.get_position(is_radian=False)
+        code, pose = self._api.get_position(is_radian=True)
         self._check(code, "get_position")
-        obs_dict: RobotObservation = {key: pose[i] / MM_PER_M for i, key in enumerate(EE_POSITION_KEYS)}
+        position = np.asarray(pose[:3], dtype=float) / MM_PER_M
+        rpy = np.asarray(pose[3:6], dtype=float)
+        orientation = Rotation.from_euler("xyz", rpy)
+
+        obs_dict: RobotObservation = {
+            **dict(zip(EE_POSITION_KEYS, position.tolist(), strict=True)),
+            **dict(zip(EE_ORIENTATION_KEYS, rpy.tolist(), strict=True)),
+            **dict(
+                zip(EE_VELOCITY_KEYS, self._tcp_twist(start, position, orientation).tolist(), strict=True)
+            ),
+        }
+        if self.config.use_ft_sensor:
+            wrench = np.asarray(self._api.ft_ext_force, dtype=float)
+            force, torque = wrench[:3], wrench[3:6]
+            if self.config.ft_sensor_frame == "base":
+                force, torque = orientation.apply(force), orientation.apply(torque)
+            obs_dict.update(zip(FORCE_KEYS, force.tolist(), strict=True))
+            obs_dict.update(zip(TORQUE_KEYS, torque.tolist(), strict=True))
         obs_dict[GRIPPER_KEY] = self._read_gripper()
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
@@ -243,7 +307,8 @@ class XArm(Robot):
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         """
-        Command an absolute TCP position target (meters, base frame) and a gripper target in [0, 1].
+        Command an absolute TCP pose target (meters and xArm roll / pitch / yaw in radians, base frame) and a
+        gripper target in [0, 1].
 
         Nothing is sent while the controller reports an error. The gripper is only commanded when its target
         changes, so the arm streaming is not slowed down by the gripper's Modbus link.
@@ -251,10 +316,10 @@ class XArm(Robot):
         Returns:
             RobotAction: the action actually sent (gripper clipped to [0, 1]).
         """
-        target_m = [float(action[key]) for key in EE_POSITION_KEYS]
+        target = [float(action[key]) for key in EE_POSE_KEYS]
         gripper = float(np.clip(action[GRIPPER_KEY], 0.0, 1.0))
         sent_action: RobotAction = {
-            **dict(zip(EE_POSITION_KEYS, target_m, strict=True)),
+            **dict(zip(EE_POSE_KEYS, target, strict=True)),
             GRIPPER_KEY: gripper,
         }
 
@@ -263,11 +328,11 @@ class XArm(Robot):
             return sent_action
 
         code = self._api.set_position(
-            *(t * MM_PER_M for t in target_m),
-            *self._hold_rpy_deg,
+            *(t * MM_PER_M for t in target[:3]),
+            *target[3:],
             speed=self.config.max_linear_speed_mm_s,
             mvacc=self.config.max_linear_acc_mm_s2,
-            is_radian=False,
+            is_radian=True,
             wait=False,
         )
         if code != 0:
@@ -287,6 +352,10 @@ class XArm(Robot):
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        if self.config.use_admittance:
+            self._api.set_ft_sensor_mode(FT_NON_FORCE_MODE)
+        if self.config.use_ft_sensor:
+            self._api.set_ft_sensor_enable(0)
         self._api.set_mode(POSITION_MODE)
         self._api.set_state(READY_STATE)
         self._api.disconnect()
@@ -319,10 +388,41 @@ class XArm(Robot):
                 raise RuntimeError(f"{self}: xArm did not switch to mode {mode}. {self.fault_description}")
             time.sleep(0.01)
 
-    def _hold_current_orientation(self) -> None:
-        code, pose = self._api.get_position(is_radian=False)
-        self._check(code, "get_position")
-        self._hold_rpy_deg = [float(angle) for angle in pose[3:6]]
+    def _tcp_twist(self, now: float, position: np.ndarray, orientation: Rotation) -> np.ndarray:
+        """Base-frame TCP twist from the previous pose reading, zero on the first reading after a reset."""
+        last = self._last_pose_reading
+        self._last_pose_reading = (now, position, orientation)
+        if last is None or now - last[0] <= 0.0:
+            return np.zeros(6)
+        dt = now - last[0]
+        linear = (position - last[1]) / dt
+        angular = (orientation * last[2].inv()).as_rotvec() / dt
+        return np.concatenate([linear, angular])
+
+    def _start_ft_sensor(self) -> None:
+        self._check(self._api.set_ft_sensor_enable(1), "set_ft_sensor_enable")
+        time.sleep(_FT_ENABLE_WAIT_S)
+        self._zero_ft_sensor()
+
+    def _zero_ft_sensor(self) -> None:
+        self._check(self._api.set_ft_sensor_zero(), "set_ft_sensor_zero")
+        time.sleep(_FT_ZERO_WAIT_S)
+
+    def _configure_admittance(self) -> None:
+        # Damping is reserved: the controller uses 2 * sqrt(M * K).
+        code = self._api.set_ft_sensor_admittance_parameters(
+            M=list(self.config.admittance_mass), K=list(self.config.admittance_stiffness), B=[0.0] * 6
+        )
+        self._check(code, "set_ft_sensor_admittance_parameters")
+        code = self._api.set_ft_sensor_admittance_parameters(
+            coord=self.config.admittance_frame, c_axis=list(self.config.admittance_axes)
+        )
+        self._check(code, "set_ft_sensor_admittance_parameters")
+
+    def _set_ft_mode(self, mode: int) -> None:
+        self._check(self._api.set_ft_sensor_mode(mode), "set_ft_sensor_mode")
+        # The force mode takes effect once the controller is set ready again.
+        self._check(self._api.set_state(READY_STATE), "set_state")
 
     def _read_gripper(self) -> float:
         ret = self._api.get_gripper_position()

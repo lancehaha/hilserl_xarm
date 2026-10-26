@@ -434,6 +434,9 @@ def _compute_basic_stats(
     if quantile_list is None:
         quantile_list = DEFAULT_QUANTILES
     quantile_list_keys = [f"q{int(q * 100):02d}" for q in quantile_list]
+    # Promote as `RunningQuantileStats.update` does, so a 1-frame episode's stats have the same dtypes (and
+    # parquet schema) as longer episodes'.
+    array = array.astype(np.result_type(array.dtype, np.float32), copy=False)
 
     stats = {
         "min": np.min(array, axis=0),

@@ -79,13 +79,14 @@ class SpaceMouseTeleop(Teleoperator):
 
         self._axes = [axis.removeprefix("-") for axis in config.axis_mapping]
         self._signs = np.array([-1.0 if axis.startswith("-") else 1.0 for axis in config.axis_mapping])
+        self._rotation_matrix = self._make_rotation_matrix(config)
 
         self._device: pyspacemouse.SpaceMouseDevice | None = None
         self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
-        self._translation = np.zeros(3, dtype=np.float32)
-        self._rotation = np.zeros(3, dtype=np.float32)  # raw (roll, pitch, yaw), not yet part of the action
+        self._translation: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._rotation: np.ndarray = np.zeros(3, dtype=np.float32)  # rotation about the puck x, y, z axes
         self._buttons: list[int] = []
 
         self._listener: keyboard.Listener | None = None
@@ -97,18 +98,16 @@ class SpaceMouseTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
+        names = ["delta_x", "delta_y", "delta_z"]
+        if self.config.use_rotation:
+            names += ["delta_rx", "delta_ry", "delta_rz"]
         if self.config.use_gripper:
-            return {
-                "dtype": "float32",
-                "shape": (4,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2, "gripper": 3},
-            }
-        else:
-            return {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2},
-            }
+            names.append("gripper")
+        return {
+            "dtype": "float32",
+            "shape": (len(names),),
+            "names": {name: i for i, name in enumerate(names)},
+        }
 
     @property
     def feedback_features(self) -> dict:
@@ -120,7 +119,13 @@ class SpaceMouseTeleop(Teleoperator):
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        self._device = pyspacemouse.open(nonblocking=True, device_index=self.config.device_index)
+        # HID_Z_UP: same translation axes as the default (legacy) convention, and roll / pitch / yaw about those
+        # same x / y / z axes. The legacy convention swaps roll and pitch and flips yaw.
+        self._device = pyspacemouse.open(
+            nonblocking=True,
+            device_index=self.config.device_index,
+            axis_convention=pyspacemouse.AxisConvention.HID_Z_UP,
+        )
         logger.info(f"{self} connected: {self._device.describe_connection()}")
 
         self._stop_event.clear()
@@ -180,6 +185,29 @@ class SpaceMouseTeleop(Teleoperator):
         deltas[np.abs(deltas) < self.config.deadzone] = 0.0
         return np.clip(deltas * self.config.scale, -1.0, 1.0).astype(np.float32)
 
+    @staticmethod
+    def _make_rotation_matrix(config: SpaceMouseTeleopConfig) -> np.ndarray:
+        """Matrix taking the puck rotation (about its x, y, z axes) to (delta_rx, delta_ry, delta_rz)."""
+        puck_axes = {"x": 0, "y": 1, "z": 2}
+        rotation_axes = {"roll": 0, "pitch": 1, "yaw": 2}
+        matrix = np.zeros((3, 3))
+        if config.rotation_mapping is None:
+            for row, axis in enumerate(config.axis_mapping):
+                matrix[row, puck_axes[axis.removeprefix("-")]] = -1.0 if axis.startswith("-") else 1.0
+            # A rotation is an axial vector: a mirrored mapping (e.g. one inverted axis) also flips its sense.
+            return matrix * np.linalg.det(matrix)
+        for row, axis in enumerate(config.rotation_mapping):
+            if axis != "0":
+                matrix[row, rotation_axes[axis.removeprefix("-")]] = -1.0 if axis.startswith("-") else 1.0
+        return matrix
+
+    def _get_rotation_deltas(self) -> np.ndarray:
+        with self._state_lock:
+            rotation: np.ndarray = self._rotation.astype(float)
+        rotation[np.abs(rotation) < self.config.rotation_deadzone] = 0.0
+        deltas = self._rotation_matrix @ rotation
+        return np.clip(deltas * self.config.rotation_scale, -1.0, 1.0).astype(np.float32)
+
     def _get_buttons(self) -> list[int]:
         with self._state_lock:
             return list(self._buttons)
@@ -201,11 +229,20 @@ class SpaceMouseTeleop(Teleoperator):
             "delta_y": deltas[1],
             "delta_z": deltas[2],
         }
+        has_input = bool(np.any(deltas != 0.0))
+        if self.config.use_rotation:
+            rotation_deltas = self._get_rotation_deltas()
+            action_dict.update(
+                {
+                    "delta_rx": rotation_deltas[0],
+                    "delta_ry": rotation_deltas[1],
+                    "delta_rz": rotation_deltas[2],
+                }
+            )
+            has_input = has_input or bool(np.any(rotation_deltas != 0.0))
         if self.config.use_gripper:
             action_dict["gripper"] = self._gripper_action_from_buttons(buttons)
-        self._last_action_has_input = bool(np.any(deltas != 0.0)) or (
-            self.config.use_gripper and any(buttons)
-        )
+        self._last_action_has_input = has_input or (self.config.use_gripper and any(buttons))
         return action_dict
 
     def get_teleop_events(self) -> dict[TeleopEvents, bool]:

@@ -176,3 +176,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Reference copy of rail-berkeley/hil-serl
+hil-serl/

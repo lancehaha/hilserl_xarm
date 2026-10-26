@@ -87,3 +87,59 @@ def test_toggle_only(make_teleop):
     assert not _is_intervention(teleop)
     teleop._is_intervention = True
     assert _is_intervention(teleop)
+
+
+def test_rotation_deltas(make_teleop):
+    teleop = make_teleop(use_rotation=True, rotation_mapping=["-pitch", "roll", "0"])
+    assert list(teleop.action_features["names"]) == [
+        "delta_x",
+        "delta_y",
+        "delta_z",
+        "delta_rx",
+        "delta_ry",
+        "delta_rz",
+        "gripper",
+    ]
+
+    # A tilt below the rotation deadzone is ignored, so translating does not also rotate.
+    teleop._rotation[:] = (0.1, 0.1, 0.9)
+    action = teleop.get_action()
+    assert [action["delta_rx"], action["delta_ry"], action["delta_rz"]] == pytest.approx([0.0, 0.0, 0.0])
+    assert not teleop.get_teleop_events()[TeleopEvents.IS_INTERVENTION]
+
+    # Rotation alone is an intervention.
+    teleop._rotation[:] = (0.5, 0.8, 0.9)
+    action = teleop.get_action()
+    assert [action["delta_rx"], action["delta_ry"], action["delta_rz"]] == pytest.approx([-0.8, 0.5, 0.0])
+    assert teleop.get_teleop_events()[TeleopEvents.IS_INTERVENTION]
+
+
+def test_no_rotation_by_default(make_teleop):
+    teleop = make_teleop()
+    teleop._rotation[:] = (0.5, 0.5, 0.5)
+    assert "delta_rx" not in teleop.get_action()
+    assert teleop.action_features["shape"] == (4,)
+
+
+def test_invalid_rotation_mapping():
+    with pytest.raises(ValueError):
+        SpaceMouseTeleopConfig(rotation_mapping=["roll", "pitch", "x"])
+
+
+@pytest.mark.parametrize(
+    "axis_mapping, puck_rotation, expected",
+    [
+        # Rotating about the axis you push along rotates about the robot axis that push moves along.
+        (["x", "y", "z"], (0.5, 0.0, 0.0), (0.5, 0.0, 0.0)),
+        (["y", "-x", "z"], (0.0, 0.5, 0.0), (0.5, 0.0, 0.0)),
+        (["y", "-x", "z"], (0.5, 0.0, 0.0), (0.0, -0.5, 0.0)),
+        # A mirrored mapping flips the rotation sense too, so the rotation stays right-handed.
+        (["-x", "y", "z"], (0.0, 0.0, 0.5), (0.0, 0.0, -0.5)),
+        (["-x", "y", "z"], (0.5, 0.0, 0.0), (0.5, 0.0, 0.0)),
+    ],
+)
+def test_rotation_follows_axis_mapping(make_teleop, axis_mapping, puck_rotation, expected):
+    teleop = make_teleop(use_rotation=True, axis_mapping=axis_mapping)
+    teleop._rotation[:] = puck_rotation
+    action = teleop.get_action()
+    assert [action["delta_rx"], action["delta_ry"], action["delta_rz"]] == pytest.approx(list(expected))

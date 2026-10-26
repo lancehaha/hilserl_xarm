@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
@@ -34,6 +35,7 @@ from lerobot.policies.gaussian_actor.modeling_gaussian_actor import (
     GaussianActorObservationEncoder,
     GaussianActorPolicy,
     orthogonal_init,
+    xavier_init_linear,
 )
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.utils.constants import ACTION
@@ -71,6 +73,7 @@ class SACAlgorithm(RLAlgorithm):
     def _init_critics(self, action_dim) -> None:
         """Build critic ensemble, targets."""
         encoder = self.policy.encoder_critic
+        target_encoder = copy.deepcopy(encoder) if self.config.use_target_encoder else encoder
 
         heads = [
             CriticHead(
@@ -79,6 +82,9 @@ class SACAlgorithm(RLAlgorithm):
             )
             for _ in range(self.config.num_critics)
         ]
+        if self.policy_config.hil_serl_init:
+            for head in heads:
+                xavier_init_linear(head)
         self.critic_ensemble = CriticEnsemble(encoder=encoder, ensemble=heads)
         target_heads = [
             CriticHead(
@@ -87,7 +93,7 @@ class SACAlgorithm(RLAlgorithm):
             )
             for _ in range(self.config.num_critics)
         ]
-        self.critic_target = CriticEnsemble(encoder=encoder, ensemble=target_heads)
+        self.critic_target = CriticEnsemble(encoder=target_encoder, ensemble=target_heads)
         self.critic_target.load_state_dict(self.critic_ensemble.state_dict())
 
         # TODO(Khalil): Investigate and fix torch.compile
@@ -98,7 +104,7 @@ class SACAlgorithm(RLAlgorithm):
 
         self.discrete_critic_target = None
         if self.policy_config.num_discrete_actions is not None:
-            self.discrete_critic_target = self._init_discrete_critic_target(encoder)
+            self.discrete_critic_target = self._init_discrete_critic_target(target_encoder)
 
     def _init_discrete_critic_target(self, encoder: GaussianActorObservationEncoder) -> DiscreteCritic:
         """Build target discrete critic (main network is owned by the policy)."""
@@ -106,7 +112,7 @@ class SACAlgorithm(RLAlgorithm):
             encoder=encoder,
             input_dim=encoder.output_dim,
             output_dim=self.policy_config.num_discrete_actions,
-            **asdict(self.config.discrete_critic_network_kwargs),
+            **asdict(self.policy_config.discrete_critic_network_kwargs),
         )
         # TODO(Khalil): Compile the discrete critic
         discrete_critic_target.load_state_dict(self.policy.discrete_critic.state_dict())
@@ -114,8 +120,13 @@ class SACAlgorithm(RLAlgorithm):
 
     def _init_temperature(self, continuous_action_dim: int) -> None:
         """Set up temperature parameter (log_alpha) and target entropy."""
+        # `log_alpha` is unconstrained: log(alpha) for "exp", softplus^-1(alpha) for "softplus"
         temp_init = self.config.temperature_init
-        self.log_alpha = nn.Parameter(torch.tensor([math.log(temp_init)]))
+        if self.config.temperature_parameterization == "softplus":
+            raw_init = math.log(math.expm1(temp_init))
+        else:
+            raw_init = math.log(temp_init)
+        self.log_alpha = nn.Parameter(torch.tensor([raw_init]))
 
         self.target_entropy = self.config.target_entropy
         if self.target_entropy is None:
@@ -132,10 +143,15 @@ class SACAlgorithm(RLAlgorithm):
         if self.discrete_critic_target is not None:
             self.discrete_critic_target.to(self._device)
 
+    def _alpha(self) -> Tensor:
+        if self.config.temperature_parameterization == "softplus":
+            return F.softplus(self.log_alpha)
+        return self.log_alpha.exp()
+
     @property
     def temperature(self) -> float:
         """Return the current temperature value, always in sync with log_alpha."""
-        return self.log_alpha.exp().item()
+        return self._alpha().item()
 
     def _critic_forward(
         self,
@@ -196,7 +212,10 @@ class SACAlgorithm(RLAlgorithm):
         Returns:
             TrainingStats with per-component losses and grad norms.
         """
-        clip = self.config.grad_clip_norm
+        if self.config.simultaneous_updates:
+            return self._update_simultaneously(batch_iterator)
+
+        clip = self.config.grad_clip_norm if self.config.grad_clip_norm is not None else float("inf")
 
         for _ in range(self.config.utd_ratio - 1):
             batch = next(batch_iterator)
@@ -218,7 +237,7 @@ class SACAlgorithm(RLAlgorithm):
             self._update_target_networks()
 
         batch = next(batch_iterator)
-        fb = self._prepare_forward_batch(batch, include_complementary_info=False)
+        fb = self._prepare_forward_batch(batch, include_complementary_info=True)
 
         loss_critic = self._compute_loss_critic(fb)
         self.optimizers["critic"].zero_grad()
@@ -267,6 +286,61 @@ class SACAlgorithm(RLAlgorithm):
         self._update_target_networks()
         self._optimization_step += 1
         return stats
+
+    def _update_simultaneously(self, batch_iterator: Iterator[BatchType]) -> TrainingStats:
+        """`update` with `simultaneous_updates`: all losses of a step are taken at the same parameters."""
+        has_discrete = self.policy_config.num_discrete_actions is not None
+
+        for _ in range(self.config.utd_ratio - 1):
+            fb = self._prepare_forward_batch(next(batch_iterator), include_complementary_info=True)
+            losses = {"critic": self._compute_loss_critic(fb)}
+            if has_discrete:
+                losses["discrete_critic"] = self._compute_loss_discrete_critic(fb)
+            self._step_simultaneously(losses)
+            self._update_target_networks()
+
+        fb = self._prepare_forward_batch(next(batch_iterator), include_complementary_info=True)
+        losses = {"critic": self._compute_loss_critic(fb)}
+        if has_discrete:
+            losses["discrete_critic"] = self._compute_loss_discrete_critic(fb)
+        update_policy = self._optimization_step % self.config.policy_update_freq == 0
+        if update_policy:
+            losses["actor"] = self._compute_loss_actor(fb)
+            losses["temperature"] = self._compute_loss_temperature(fb)
+        grad_norms = self._step_simultaneously(losses)
+
+        stats = TrainingStats(
+            losses={f"loss_{name}": loss.item() for name, loss in losses.items()},
+            grad_norms=grad_norms,
+        )
+        if update_policy:
+            stats.extra["temperature"] = self.temperature
+
+        self._update_target_networks()
+        self._optimization_step += 1
+        return stats
+
+    def _step_simultaneously(self, losses: dict[str, Tensor]) -> dict[str, float]:
+        """Step the optimizer of each loss with gradients all taken first (as rail-berkeley/hil-serl).
+
+        Parameters shared between losses (e.g. the encoder) get the sum of the optimizers' updates: Adam's
+        update depends on its own gradient and state only, so stepping one after the other is equivalent.
+        """
+        clip = self.config.grad_clip_norm if self.config.grad_clip_norm is not None else float("inf")
+        grads = {}
+        for name, loss in losses.items():
+            groups = self.optimizers[name].param_groups
+            params = [p for group in groups for p in group["params"] if p.requires_grad]
+            grads[name] = (params, torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True))
+
+        grad_norms = {}
+        for name, (params, param_grads) in grads.items():
+            for param, grad in zip(params, param_grads, strict=True):
+                param.grad = grad
+            grad_norms[name] = torch.nn.utils.clip_grad_norm_(params, max_norm=clip).item()
+            self.optimizers[name].step()
+            self.optimizers[name].zero_grad()
+        return grad_norms
 
     def _compute_loss_critic(self, batch: dict[str, Any]) -> Tensor:
         # Extract common components from batch
@@ -396,27 +470,30 @@ class SACAlgorithm(RLAlgorithm):
 
         actions_pi, log_probs, _ = self.policy.actor(observations, observation_features)
 
-        q_preds = self._critic_forward(
-            observations=observations,
-            actions=actions_pi,
-            use_target=False,
-            observation_features=observation_features,
-        )
-        min_q_preds = q_preds.min(dim=0)[0]
+        # The actor loss only reaches the encoder through the actor, as rail-berkeley/hil-serl
+        q_preds = self.critic_ensemble(observations, actions_pi, observation_features, detach_encoder=True)
+        if self.config.actor_q_reduction == "mean":
+            q_pred = q_preds.mean(dim=0)
+        else:
+            q_pred = q_preds.min(dim=0)[0]
 
-        actor_loss = ((self.temperature * log_probs) - min_q_preds).mean()
+        actor_loss = ((self.temperature * log_probs) - q_pred).mean()
         return actor_loss
 
     def _compute_loss_temperature(self, batch: dict[str, Any]) -> Tensor:
         """Compute the temperature loss"""
-        observations = batch["state"]
-        observation_features = batch.get("observation_feature")
+        if self.config.temperature_uses_next_observations:
+            observations = batch["next_state"]
+            observation_features = batch.get("next_observation_feature")
+        else:
+            observations = batch["state"]
+            observation_features = batch.get("observation_feature")
 
         # calculate temperature loss
         with torch.no_grad():
             _, log_probs, _ = self.policy.actor(observations, observation_features)
 
-        temperature_loss = (-self.log_alpha.exp() * (log_probs + self.target_entropy)).mean()
+        temperature_loss = (-self._alpha() * (log_probs + self.target_entropy)).mean()
         return temperature_loss
 
     def _update_target_networks(self) -> None:
@@ -429,11 +506,14 @@ class SACAlgorithm(RLAlgorithm):
                 + target_p.data * (1.0 - self.config.critic_target_update_weight)
             )
         if self.policy_config.num_discrete_actions is not None:
-            for target_p, p in zip(
-                self.discrete_critic_target.parameters(),
+            for (name, target_p), p in zip(
+                self.discrete_critic_target.named_parameters(),
                 self.policy.discrete_critic.parameters(),
                 strict=True,
             ):
+                if self.config.use_target_encoder and name.startswith("encoder."):
+                    # Already updated with `critic_target`, which shares the target encoder
+                    continue
                 target_p.data.copy_(
                     p.data * self.config.critic_target_update_weight
                     + target_p.data * (1.0 - self.config.critic_target_update_weight)
@@ -526,7 +606,11 @@ class SACAlgorithm(RLAlgorithm):
         bundle: dict[str, torch.Tensor] = {}
         for k, v in _strip_encoder_keys(self.critic_ensemble.state_dict()).items():
             bundle[f"critic_ensemble.{k}"] = v
-        for k, v in _strip_encoder_keys(self.critic_target.state_dict()).items():
+        # The target encoder is algorithm-owned when `use_target_encoder`, saved with `critic_target`
+        critic_target_state = self.critic_target.state_dict()
+        if not self.config.use_target_encoder:
+            critic_target_state = _strip_encoder_keys(critic_target_state)
+        for k, v in critic_target_state.items():
             bundle[f"critic_target.{k}"] = v
         if self.discrete_critic_target is not None:
             for k, v in _strip_encoder_keys(self.discrete_critic_target.state_dict()).items():
@@ -653,12 +737,17 @@ class CriticEnsemble(nn.Module):
         observations: dict[str, torch.Tensor],
         actions: torch.Tensor,
         observation_features: torch.Tensor | None = None,
+        detach_encoder: bool = False,
     ) -> torch.Tensor:
         device = get_device_from_parameters(self)
         # Move each tensor in observations to device
         observations = {k: v.to(device) for k, v in observations.items()}
 
-        obs_enc = self.encoder(observations, cache=observation_features)
+        obs_enc = self.encoder(
+            observations, cache=observation_features, image_dropout=self.encoder.config.critic_image_dropout
+        )
+        if detach_encoder:
+            obs_enc = obs_enc.detach()
 
         inputs = torch.cat([obs_enc, actions], dim=-1)
 

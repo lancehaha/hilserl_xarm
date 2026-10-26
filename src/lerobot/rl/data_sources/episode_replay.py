@@ -55,6 +55,16 @@ class EpisodeReplayIndex:
         self.slot_owner: list[int | None] = [None] * buffer.capacity
         self.next_episode_id = 0
 
+    @staticmethod
+    def _gripper_closed_from_state(state) -> bool:
+        if state is None:
+            return False
+        values = state.reshape(-1)
+        # The earlier 8-D state placed the gripper after xyz; the current pose/twist
+        # state (13-D or 19-D with force/torque) places it last.
+        gripper_index = 3 if values.numel() <= 8 else -1
+        return bool(float(values[gripper_index]) >= 0.5)
+
     def rebuild_from_buffer(self) -> None:
         """Restore episode labels for transitions loaded when training resumes.
 
@@ -84,7 +94,7 @@ class EpisodeReplayIndex:
         )
         states = self.buffer.states.get("observation.state")
         first_state = states[slots[0]] if states is not None else None
-        gripper_closed = bool(float(first_state.reshape(-1)[3]) >= 0.5) if first_state is not None else False
+        gripper_closed = self._gripper_closed_from_state(first_state)
         path_length_m = 0.0
         event_slots: list[int] = []
         for index, slot in enumerate(slots):
@@ -160,7 +170,7 @@ class EpisodeReplayIndex:
         self.episodes[episode_id] = record
 
         first_state = transitions[0]["state"].get("observation.state")
-        gripper_closed = bool(float(first_state.reshape(-1)[3]) >= 0.5) if first_state is not None else False
+        gripper_closed = self._gripper_closed_from_state(first_state)
 
         for transition in transitions:
             slot = self.buffer.position

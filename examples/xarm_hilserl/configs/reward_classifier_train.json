@@ -1,13 +1,16 @@
 {
   "dataset": {
-    "repo_id": "local/xarm7_hilserl_classifier_merged",
+    "repo_id": "local/xarm7_hilserl_classifier_cropped_resized",
+    "image_transforms": {
+      "enable": true
+    },
     "root": null
   },
   "reward_model": {
     "type": "reward_classifier",
     "model_name": "lerobot/resnet10",
     "model_type": "cnn",
-    "num_cameras": 2,
+    "num_cameras": 3,
     "num_classes": 2,
     "hidden_dim": 256,
     "dropout_rate": 0.1,
@@ -23,6 +26,14 @@
         ]
       },
       "observation.images.side": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
+      "observation.images.front": {
         "type": "VISUAL",
         "shape": [
           3,
@@ -45,5 +56,5 @@
     "enable": false,
     "project": "xarm7-reward-classifier"
   },
-  "job_name": "xarm7_reward_classifier"
+  "job_name": "xarm7_reward_classifier_v3"
 }

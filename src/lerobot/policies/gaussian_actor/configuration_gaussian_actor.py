@@ -57,12 +57,17 @@ class ActorLearnerConfig:
     learner_host: str = "127.0.0.1"
     learner_port: int = 50051
     policy_parameters_push_frequency: int = 4
+    # If set, push the policy every this many optimization steps instead of every
+    # `policy_parameters_push_frequency` seconds (rail-berkeley/hil-serl `steps_per_update` = 50)
+    policy_parameters_push_steps: int | None = None
     queue_get_timeout: float = 2
 
 
 @dataclass
 class CriticNetworkConfig:
     hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    # Name of a `torch.nn` activation, e.g. "SiLU" or "Tanh" (as rail-berkeley/hil-serl)
+    activations: str = "SiLU"
     activate_final: bool = True
     final_activation: str | None = None
 
@@ -70,6 +75,8 @@ class CriticNetworkConfig:
 @dataclass
 class ActorNetworkConfig:
     hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    # Name of a `torch.nn` activation, e.g. "SiLU" or "Tanh" (as rail-berkeley/hil-serl)
+    activations: str = "SiLU"
     activate_final: bool = True
 
 
@@ -137,13 +144,23 @@ class GaussianActorConfig(PreTrainedConfig):
     image_encoder_hidden_dim: int = 32
     # Whether to use a shared encoder for actor and critic
     shared_encoder: bool = True
+    # With a shared encoder, also train its state (and env) encoder with the actor loss. The image
+    # features are always detached on the actor side; rail-berkeley/hil-serl detaches only those.
+    actor_trains_state_encoder: bool = False
+    # Initialize as rail-berkeley/hil-serl (Flax defaults) instead of the PyTorch / orthogonal defaults and
+    # `init_final`: Xavier uniform for the actor, critics and state encoder, truncated LeCun normal for the
+    # image spatial embeddings and projections, zero biases
+    hil_serl_init: bool = False
+    # Apply the image-embedding dropout when the critics encode observations. rail-berkeley/hil-serl only
+    # applies it on the actor side.
+    critic_image_dropout: bool = True
     # Number of discrete actions, eg for gripper actions
     num_discrete_actions: int | None = None
     # Dimension of the image embedding pooling
     image_embedding_pooling_dim: int = 8
 
     # Encoder architecture
-    # Hidden dimension size for the state encoder
+    # Output dimension of the state encoder (rail-berkeley/hil-serl uses 64)
     state_encoder_hidden_dim: int = 256
     # Dimension of the latent space
     latent_dim: int = 256

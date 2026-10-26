@@ -35,11 +35,14 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
     end-effector (x, y, z) and optionally the gripper.
 
     Attributes:
-        use_gripper: If True, assumes the 4th element of the tensor is the
+        use_gripper: If True, assumes the element after the deltas is the
                      gripper action.
+        use_rotation: If True, elements 3-5 are the rotation deltas
+                      (`delta_rx`, `delta_ry`, `delta_rz`), for 6-DoF control.
     """
 
     use_gripper: bool = True
+    use_rotation: bool = False
 
     def action(self, action: PolicyAction) -> RobotAction:
         if not isinstance(action, torch.Tensor):
@@ -48,20 +51,30 @@ class MapTensorToDeltaActionDictStep(ActionProcessorStep):
         if action.dim() > 1:
             action = action.squeeze(0)
 
-        # TODO (maractingi): add rotation
         delta_action = {
             "delta_x": action[0].item(),
             "delta_y": action[1].item(),
             "delta_z": action[2].item(),
         }
+        gripper_index = 3
+        if self.use_rotation:
+            delta_action.update(
+                {
+                    "delta_rx": action[3].item(),
+                    "delta_ry": action[4].item(),
+                    "delta_rz": action[5].item(),
+                }
+            )
+            gripper_index = 6
         if self.use_gripper:
-            delta_action["gripper"] = action[3].item()
+            delta_action["gripper"] = action[gripper_index].item()
         return delta_action
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        for axis in ["x", "y", "z"]:
+        axes = ["x", "y", "z", "rx", "ry", "rz"] if self.use_rotation else ["x", "y", "z"]
+        for axis in axes:
             features[PipelineFeatureType.ACTION][f"delta_{axis}"] = PolicyFeature(
                 type=FeatureType.ACTION, shape=(1,)
             )
@@ -100,22 +113,23 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         delta_y = action.pop("delta_y")
         delta_z = action.pop("delta_z")
         gripper = action.pop("gripper")
+        # Rotation deltas are only present for 6-DoF teleoperators / policies.
+        target_wx = float(action.pop("delta_rx", 0.0))
+        target_wy = float(action.pop("delta_ry", 0.0))
+        target_wz = float(action.pop("delta_rz", 0.0))
 
         # Determine if the teleoperator is actively providing input
         # Consider enabled if any significant movement delta is detected
         position_magnitude = (delta_x**2 + delta_y**2 + delta_z**2) ** 0.5  # Use Euclidean norm for position
-        enabled = position_magnitude > self.noise_threshold  # Small threshold to avoid noise
+        rotation_magnitude = (target_wx**2 + target_wy**2 + target_wz**2) ** 0.5
+        enabled = (
+            max(position_magnitude, rotation_magnitude) > self.noise_threshold
+        )  # Small threshold to avoid noise
 
         # Scale the deltas appropriately
         scaled_delta_x = delta_x * self.position_scale
         scaled_delta_y = delta_y * self.position_scale
         scaled_delta_z = delta_z * self.position_scale
-
-        # For gamepad/keyboard, we don't have rotation input, so set to 0
-        # These could be extended in the future for more sophisticated teleoperators
-        target_wx = 0.0
-        target_wy = 0.0
-        target_wz = 0.0
 
         # Update action with robot target format
         action = {
@@ -134,7 +148,7 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        for axis in ["x", "y", "z"]:
+        for axis in ["x", "y", "z", "rx", "ry", "rz"]:
             features[PipelineFeatureType.ACTION].pop(f"delta_{axis}", None)
         features[PipelineFeatureType.ACTION].pop("gripper", None)
 

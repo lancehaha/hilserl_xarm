@@ -31,7 +31,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--ip", default="192.168.1.235")
 parser.add_argument("--mapping", nargs=3, default=["x", "y", "z"], help="puck axis driving robot X, Y, Z")
 parser.add_argument("--step_mm", type=float, default=5.0, help="TCP step per tick at full puck deflection")
-parser.add_argument("--box_mm", type=float, default=300.0, help="max distance from the starting_pose pose per axis")
+parser.add_argument(
+    "--box_mm", type=float, default=300.0, help="max distance from the starting_pose pose per axis"
+)
 parser.add_argument("--rot", action="store_true", help="also follow puck tilt / twist")
 parser.add_argument(
     "--rot_mapping",

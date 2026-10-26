@@ -478,11 +478,14 @@ class InterventionActionProcessorStep(ProcessorStep):
 
     Attributes:
         use_gripper: Whether to include the gripper in the teleoperated action.
+        use_rotation: Whether to include the rotation deltas (`delta_rx`, `delta_ry`, `delta_rz`) after the
+                      translation deltas, for 6-DoF control.
         terminate_on_success: If True, automatically sets the `done` flag when a
                               `success` event is received.
     """
 
     use_gripper: bool = False
+    use_rotation: bool = False
     terminate_on_success: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -524,6 +527,8 @@ class InterventionActionProcessorStep(ProcessorStep):
                     teleop_action.get("delta_y", 0.0),
                     teleop_action.get("delta_z", 0.0),
                 ]
+                if self.use_rotation:
+                    action_list += [teleop_action.get(f"delta_r{axis}", 0.0) for axis in "xyz"]
                 if self.use_gripper:
                     action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
             elif isinstance(teleop_action, np.ndarray):
@@ -567,6 +572,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         """
         return {
             "use_gripper": self.use_gripper,
+            "use_rotation": self.use_rotation,
             "terminate_on_success": self.terminate_on_success,
         }
 

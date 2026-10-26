@@ -6,23 +6,39 @@
   "num_workers": 4,
   "batch_size": 256,
   "steps": 100000,
-  "log_freq": 500,
+  "log_freq": 10,
   "save_checkpoint": true,
-  "save_freq": 5000,
+  "save_freq": 2000,
   "wandb": {
-    "enable": false,
+    "enable": true,
     "project": "xarm7_hilserl",
     "disable_artifact": true
   },
   "dataset": {
-    "repo_id": "local/xarm7_hilserl_demos_cropped_resized",
+    "repo_id": "local/xarm7_hilserl_demos_6dof_ft_toolft",
     "use_imagenet_stats": false
   },
   "algorithm": {
     "type": "sac",
     "temperature_init": 0.01,
-    "discount": 0.97,
-    "utd_ratio": 1
+    "discount": 0.98,
+    "utd_ratio": 2,
+    "use_backup_entropy": false,
+    "grad_clip_norm": null,
+    "actor_q_reduction": "mean",
+    "critic_network_kwargs": {
+      "hidden_dims": [
+        256,
+        256
+      ],
+      "activations": "Tanh",
+      "activate_final": true,
+      "final_activation": null
+    },
+    "use_target_encoder": true,
+    "temperature_parameterization": "softplus",
+    "temperature_uses_next_observations": true,
+    "simultaneous_updates": true
   },
   "mixer": "episode_aware",
   "online_ratio": 0.5,
@@ -51,10 +67,18 @@
           128
         ]
       },
+      "observation.images.front": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
       "observation.state": {
         "type": "STATE",
         "shape": [
-          8
+          19
         ]
       }
     },
@@ -62,7 +86,7 @@
       "action": {
         "type": "ACTION",
         "shape": [
-          3
+          6
         ]
       }
     },
@@ -91,35 +115,75 @@
           0.225
         ]
       },
+      "observation.images.front": {
+        "mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "std": [
+          0.229,
+          0.224,
+          0.225
+        ]
+      },
       "observation.state": {
         "min": [
-          -0.3409,
-          0.2151,
-          0.0657,
-          0.0,
-          -0.1,
-          -0.1,
-          -0.1,
-          -10.0
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
+          -1.0
         ],
         "max": [
-          0.0058,
-          0.5081,
-          0.247,
           1.0,
-          0.1,
-          0.1,
-          0.1,
-          10.0
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
         ]
       },
       "action": {
         "min": [
           -1.0,
           -1.0,
+          -1.0,
+          -1.0,
+          -1.0,
           -1.0
         ],
         "max": [
+          1.0,
+          1.0,
+          1.0,
           1.0,
           1.0,
           1.0
@@ -133,18 +197,46 @@
     "freeze_vision_encoder": true,
     "shared_encoder": true,
     "online_steps": 1000000,
-    "online_buffer_capacity": 100000,
-    "offline_buffer_capacity": 100000,
+    "online_buffer_capacity": 200000,
+    "offline_buffer_capacity": 200000,
     "online_step_before_learning": 100,
     "actor_learner_config": {
       "learner_host": "127.0.0.1",
       "learner_port": 50051,
-      "policy_parameters_push_frequency": 2
+      "policy_parameters_push_frequency": 2,
+      "policy_parameters_push_steps": 50
     },
     "concurrency": {
       "actor": "threads",
       "learner": "threads"
-    }
+    },
+    "state_encoder_hidden_dim": 64,
+    "actor_network_kwargs": {
+      "hidden_dims": [
+        256,
+        256
+      ],
+      "activations": "Tanh",
+      "activate_final": true
+    },
+    "discrete_critic_network_kwargs": {
+      "hidden_dims": [
+        256,
+        256
+      ],
+      "activations": "Tanh",
+      "activate_final": false,
+      "final_activation": null
+    },
+    "policy_kwargs": {
+      "use_tanh_squash": true,
+      "std_min": 1e-05,
+      "std_max": 5.0,
+      "init_final": null
+    },
+    "actor_trains_state_encoder": true,
+    "hil_serl_init": true,
+    "critic_image_dropout": false
   },
   "env": {
     "name": "real_robot",
@@ -153,7 +245,7 @@
       "type": "xarm",
       "id": "xarm7",
       "ip": "192.168.1.235",
-      "max_linear_speed_mm_s": 200.0,
+      "max_linear_speed_mm_s": 100.0,
       "max_linear_acc_mm_s2": 2000.0,
       "home_joint_speed_deg_s": 30.0,
       "gripper_open_pos": 800,
@@ -174,8 +266,44 @@
           "width": 640,
           "height": 480,
           "fps": 30
+        },
+        "front": {
+          "type": "intelrealsense",
+          "serial_number_or_name": "263522074909",
+          "width": 640,
+          "height": 480,
+          "fps": 30
         }
-      }
+      },
+      "use_ft_sensor": true,
+      "ft_sensor_frame": "tool",
+      "use_admittance": true,
+      "admittance_stiffness": [
+        2000.0,
+        2000.0,
+        2000.0,
+        20.0,
+        20.0,
+        20.0
+      ],
+      "admittance_mass": [
+        0.06,
+        0.06,
+        0.06,
+        0.0006,
+        0.0006,
+        0.0006
+      ],
+      "admittance_axes": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "admittance_frame": 0,
+      "random_rz_range_rad": 0.0
     },
     "teleop": {
       "type": "spacemouse",
@@ -186,21 +314,42 @@
         "x",
         "y",
         "z"
-      ]
+      ],
+      "use_rotation": true,
+      "rotation_mapping": null,
+      "rotation_deadzone": 0.15,
+      "rotation_scale": 1.0
     },
     "processor": {
       "control_mode": "spacemouse",
       "max_gripper_pos": 1.0,
       "observation": {
         "display_cameras": false,
-        "add_joint_velocity_to_observation": true,
+        "add_joint_velocity_to_observation": false,
         "add_current_to_observation": false,
-        "add_ee_pose_to_observation": false
+        "add_ee_pose_to_observation": false,
+        "relative_ee_frame": true
       },
       "image_preprocessing": {
         "crop_params_dict": {
-          "observation.images.wrist": [1, 78, 493, 558],
-          "observation.images.side": [135, 142, 317, 370]
+          "observation.images.wrist": [
+            1,
+            0,
+            477,
+            640
+          ],
+          "observation.images.side": [
+            144,
+            77,
+            313,
+            470
+          ],
+          "observation.images.front": [
+            67,
+            15,
+            413,
+            606
+          ]
         },
         "resize_size": [
           128,
@@ -213,13 +362,13 @@
       },
       "reset": {
         "fixed_reset_joint_positions": [
-          65.29,
-          -21.95,
-          44.04,
-          36.9,
-          21.19,
-          52.5,
-          4.43
+          102.12,
+          -8.46,
+          12.85,
+          38.66,
+          2.26,
+          44.96,
+          46.88
         ],
         "reset_time_s": 5.0,
         "control_time_s": 90.0,
@@ -230,14 +379,20 @@
         "target_frame_name": null,
         "end_effector_bounds": {
           "min": [
-            -0.3409,
-            0.2151,
-            0.0657
+            -0.3139,
+            0.0814,
+            0.2143,
+            -3.1416,
+            -3.1416,
+            -3.1416
           ],
           "max": [
-            0.0058,
-            0.5081,
-            0.247
+            -0.0215,
+            0.5536,
+            0.4667,
+            3.1416,
+            3.1416,
+            3.1416
           ]
         },
         "end_effector_step_sizes": {
@@ -245,10 +400,31 @@
           "y": 0.01,
           "z": 0.01
         },
-        "delta_reference": "measured"
+        "delta_reference": "measured",
+        "use_rotation": true,
+        "end_effector_rot_step": 0.06,
+        "action_frame": "ee",
+        "reference_clip": {
+          "min": [
+            -0.01,
+            -0.01,
+            -0.01,
+            -0.05,
+            -0.05,
+            -0.05
+          ],
+          "max": [
+            0.01,
+            0.01,
+            0.01,
+            0.05,
+            0.05,
+            0.05
+          ]
+        }
       },
       "reward_classifier": {
-        "pretrained_path": "outputs/train/xarm7_reward_classifier/checkpoints/last/pretrained_model",
+        "pretrained_path": "outputs/train/xarm7_reward_classifier_v3/checkpoints/last/pretrained_model",
         "success_threshold": 0.5,
         "success_reward": 1.0
       }
@@ -272,22 +448,31 @@
           128
         ]
       },
+      "observation.images.front": {
+        "type": "VISUAL",
+        "shape": [
+          3,
+          128,
+          128
+        ]
+      },
       "observation.state": {
         "type": "STATE",
         "shape": [
-          8
+          19
         ]
       },
       "action": {
         "type": "ACTION",
         "shape": [
-          3
+          6
         ]
       }
     },
     "features_map": {
       "observation.images.wrist": "observation.images.wrist",
       "observation.images.side": "observation.images.side",
+      "observation.images.front": "observation.images.front",
       "observation.state": "observation.state",
       "action": "action"
     }

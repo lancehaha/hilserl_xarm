@@ -261,6 +261,16 @@ class InverseKinematicsConfig:
     # Without a `urdf_path` the robot's controller does the IK. Pose the end-effector delta is applied to:
     # "measured" (current pose, as in rail-berkeley/hil-serl) or "commanded" (previous target).
     delta_reference: str = "measured"
+    # Native Cartesian control only (see `CartesianDeltaToTargetStep`):
+    # 6-DoF control: the action holds rotation deltas after the translation deltas.
+    use_rotation: bool = False
+    # Rotation (rad) for a full-scale rotation delta, the second entry of hil-serl's `ACTION_SCALE`.
+    end_effector_rot_step: float | None = None
+    # Frame of the action deltas: "base" or "ee" (end-effector frame, hil-serl's `RelativeFrame`).
+    action_frame: str = "base"
+    # Optional "min" / "max" bounds on target - measured pose: xyz (m), optionally followed by a rotation
+    # vector (rad). hil-serl's impedance controller reference clipping (`translational_clip_*`, ...).
+    reference_clip: dict[str, list[float]] | None = None
 
 
 @dataclass
@@ -270,6 +280,9 @@ class ObservationConfig:
     add_joint_velocity_to_observation: bool = False
     add_current_to_observation: bool = False
     add_ee_pose_to_observation: bool = False
+    # Express the end-effector pose relative to the reset pose and the twist in the end-effector frame, as
+    # hil-serl's `RelativeFrame` (native Cartesian robots whose state starts with pose + twist, e.g. xArm).
+    relative_ee_frame: bool = False
     display_cameras: bool = False
 
 

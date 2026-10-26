@@ -63,16 +63,44 @@ class GaussianActorPolicy(
         self._init_encoders()
         self._init_actor(continuous_action_dim)
         self._init_discrete_critic()
+        if config.hil_serl_init:
+            self._hil_serl_init()
 
     def get_optim_params(self) -> dict:
+        state_encoder_prefixes = ("encoder.state_encoder.", "encoder.env_encoder.")
         optim_params = {
             "actor": [
                 p
                 for n, p in self.actor.named_parameters()
-                if not n.startswith("encoder") or not self.shared_encoder
+                if not n.startswith("encoder")
+                or not self.shared_encoder
+                or (self.config.actor_trains_state_encoder and n.startswith(state_encoder_prefixes))
             ],
         }
         return optim_params
+
+    def _hil_serl_init(self) -> None:
+        """Re-initialize the trainable layers as rail-berkeley/hil-serl, see `hil_serl_init`."""
+        modules: list[nn.Module] = [self.actor.network, self.actor.mean_layer]
+        if self.actor.fixed_std is None:
+            modules.append(self.actor.std_layer)
+        if self.discrete_critic is not None:
+            modules += [self.discrete_critic.net, self.discrete_critic.output_layer]
+        for encoder in {id(e): e for e in (self.encoder_critic, self.encoder_actor)}.values():
+            for name in ("state_encoder", "env_encoder"):
+                if hasattr(encoder, name):
+                    modules.append(getattr(encoder, name))
+            if encoder.has_images:
+                for embedding in encoder.spatial_embeddings.values():
+                    fan_in = embedding.channel * embedding.height * embedding.width
+                    lecun_normal_(embedding.kernel, fan_in=fan_in)
+                for post_encoder in encoder.post_encoders.values():
+                    for layer in post_encoder.modules():
+                        if isinstance(layer, nn.Linear):
+                            lecun_normal_(layer.weight, fan_in=layer.in_features)
+                            nn.init.zeros_(layer.bias)
+        for module in modules:
+            xavier_init_linear(module)
 
     def reset(self):
         """Reset the policy"""
@@ -225,8 +253,8 @@ class GaussianActorObservationEncoder(nn.Module):
         if self.has_state:
             dim = input_features[OBS_STATE].shape[0]
             self.state_encoder = nn.Sequential(
-                nn.Linear(dim, self.config.latent_dim),
-                nn.LayerNorm(self.config.latent_dim),
+                nn.Linear(dim, self.config.state_encoder_hidden_dim),
+                nn.LayerNorm(self.config.state_encoder_hidden_dim),
                 nn.Tanh(),
             )
 
@@ -237,17 +265,21 @@ class GaussianActorObservationEncoder(nn.Module):
         if self.has_env:
             out += self.config.latent_dim
         if self.has_state:
-            out += self.config.latent_dim
+            out += self.config.state_encoder_hidden_dim
         self._out_dim = out
 
     def forward(
-        self, obs: dict[str, Tensor], cache: dict[str, Tensor] | None = None, detach: bool = False
+        self,
+        obs: dict[str, Tensor],
+        cache: dict[str, Tensor] | None = None,
+        detach: bool = False,
+        image_dropout: bool = True,
     ) -> Tensor:
         parts = []
         if self.has_images:
             if cache is None:
                 cache = self.get_cached_image_features(obs)
-            parts.append(self._encode_images(cache, detach))
+            parts.append(self._encode_images(cache, detach, image_dropout))
         if self.has_env:
             parts.append(self.env_encoder(obs[OBS_ENV_STATE]))
         if self.has_state:
@@ -287,7 +319,7 @@ class GaussianActorObservationEncoder(nn.Module):
         chunks = torch.chunk(out, len(self.image_keys), dim=0)
         return dict(zip(self.image_keys, chunks, strict=False))
 
-    def _encode_images(self, cache: dict[str, Tensor], detach: bool) -> Tensor:
+    def _encode_images(self, cache: dict[str, Tensor], detach: bool, image_dropout: bool = True) -> Tensor:
         """Encode image features from cached observations.
 
         This function takes pre-encoded image features from the cache and applies spatial embeddings and post-encoders.
@@ -306,7 +338,9 @@ class GaussianActorObservationEncoder(nn.Module):
         for k, feat in cache.items():
             safe_key = k.replace(".", "_")
             x = self.spatial_embeddings[safe_key](feat)
-            x = self.post_encoders[safe_key](x)
+            post_encoder = self.post_encoders[safe_key]
+            # The first post-encoder layer is the dropout
+            x = post_encoder(x) if image_dropout else post_encoder[1:](x)
             if detach:
                 x = x.detach()
             feats.append(x)
@@ -412,7 +446,9 @@ class DiscreteCritic(nn.Module):
     ) -> torch.Tensor:
         device = get_device_from_parameters(self)
         observations = {k: v.to(device) for k, v in observations.items()}
-        obs_enc = self.encoder(observations, cache=observation_features)
+        obs_enc = self.encoder(
+            observations, cache=observation_features, image_dropout=self.encoder.config.critic_image_dropout
+        )
         return self.output_layer(self.net(obs_enc))
 
 
@@ -576,6 +612,22 @@ class PretrainedImageEncoder(nn.Module):
     def forward(self, x):
         enc_feat = self.image_enc_layers(x).last_hidden_state
         return enc_feat
+
+
+def lecun_normal_(tensor: Tensor, fan_in: int) -> None:
+    """Flax `lecun_normal`: truncated normal at 2 std, rescaled to variance 1 / fan_in."""
+    std = (1.0 / fan_in) ** 0.5 / 0.87962566103423978
+    with torch.no_grad():
+        nn.init.trunc_normal_(tensor, std=std, a=-2 * std, b=2 * std)
+
+
+def xavier_init_linear(module: nn.Module) -> None:
+    """Xavier uniform weights and zero biases for every `nn.Linear` in `module`, as rail-berkeley/hil-serl."""
+    for layer in module.modules():
+        if isinstance(layer, nn.Linear):
+            nn.init.xavier_uniform_(layer.weight)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
 
 def orthogonal_init():
